@@ -1,0 +1,6 @@
+.DS_Store
+*.swp
+build/
+# Gebaute Artefakte liegen ausserhalb des Repos (~/Applications, ~/Library/Services).
+scratch/
+.commit-lock

@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ncpin — Nextcloud-VFS-Pin per Kommandozeile setzen.
+
+Hintergrund (für Einsteiger):
+  Der Nextcloud-Desktop-Client kann Dateien "virtuell" halten (Virtual Files /
+  VFS, hier im "suffix"-Modus). Eine online-only Datei liegt lokal nur als
+  winziger Platzhalter "<name>.nextcloud" (1 Byte). Holt man sie lokal
+  ("hydrieren"), wird daraus die echte Datei "<name>".
+
+  Im Finder macht das normalerweise das Rechtsklick-Menü der FinderSync-
+  Extension ("Immer lokal verfügbar machen" / "Lokalen Speicherplatz
+  freigeben"). Diese Extension lässt sich auf manchen macOS-Versionen nicht
+  aktivieren — dann fehlt das Menü.
+
+  ncpin geht daran vorbei: Die Extension ist nur ein dummer Bote. Die
+  eigentliche Arbeit macht der laufende Client über einen lokalen Unix-Socket.
+  ncpin spricht diesen Socket direkt an — exakt dieselben Befehle, die auch
+  die Extension schicken würde.
+
+Socket-Protokoll (zeilenbasiert, UTF-8, je Befehl mit "\\n" abgeschlossen):
+  MAKE_AVAILABLE_LOCALLY:<absoluter pfad>   -> hydrieren / "immer lokal" (pin)
+  MAKE_ONLINE_ONLY:<absoluter pfad>         -> dehydrieren / Speicher freigeben
+  GET_MENU_ITEMS:<absoluter pfad>           -> liefert u.a. den Ist-Pin-Zustand
+  Beim Verbinden schickt der Server zuerst "REGISTER_PATH:<sync-ordner>".
+
+Headless/AI-Agent (maschinenlesbar):
+  ncpin status --json <pfad>     -> JSON je Pfad, Exit-Code spricht Bände
+  Exit-Codes: 0 ok | 1 Laufzeitfehler (kein Client/Socket) | 2 Aufruf-Fehler
+              | 3 ein/mehrere Pfade nicht gefunden oder nicht im Nextcloud-Ordner
+"""
+
+import argparse
+import glob
+import json
+import os
+import plistlib
+import socket
+import stat
+import sys
+import time
+
+# Standard-Suffix der virtuellen Platzhalter. Nextcloud-Branding = ".nextcloud",
+# ownCloud = ".owncloud". Per Umgebungsvariable überschreibbar.
+SUFFIX = os.environ.get("NCPIN_SUFFIX", ".nextcloud")
+
+# Wartebudgets (Sekunden) fuer das Lesen einer Server-Antwort.
+#
+# Das Nicht-Offensichtliche (war die eigentliche Latenz-Ursache, ~3s pro Aufruf):
+# Der Client schickt seine Antwort (Handshake-Zeilen bzw. Menue) als EINEN kurzen
+# Burst und haelt die Verbindung danach offen, ohne weiterzusenden. Ein fixes
+# recv() blockiert dann bis zum Socket-Timeout (3s) — nicht bis HANDSHAKE_WAIT.
+# Loesung (_recv_burst): auf das erste Paket bis HANDSHAKE_WAIT warten, danach nur
+# noch eine kurze Idle-Spanne (RECV_IDLE) auf Nachzuegler; bleibt es still, ist der
+# Server fertig -> abbrechen. RECV_MAX ist nur ein Sicherheitsnetz gegen Haenger.
+HANDSHAKE_WAIT = 0.6   # max. Wartezeit auf das ERSTE Antwort-Paket
+RECV_IDLE = 0.1        # "Server fertig"-Luecke: so lange ohne neue Daten -> Ende
+                       #   (Burst-Pakete am Connect kommen ~gleichzeitig; 0,1s
+                       #    faengt auch mehrere Sync-Ordner sicher mit ein)
+RECV_MAX = 3.0         # harte Obergrenze pro Lesevorgang
+
+
+# ---------------------------------------------------------------------------
+# Socket finden + ansprechen
+# ---------------------------------------------------------------------------
+
+def _socket_candidates(override=None):
+    """Liefert strikte explizite oder automatisch gefundene Kandidaten."""
+    if override is not None:
+        return [override]
+    env = os.environ.get("NCPIN_SOCKET")
+    if env:
+        return [env]
+
+    home = os.path.expanduser("~")
+    gc = os.path.join(home, "Library", "Group Containers")
+    candidates = sorted(glob.glob(
+        os.path.join(gc, "*.com.nextcloud.desktopclient", "s")))
+    candidates.append(os.path.join(
+        gc, "com.nextcloud.desktopclient", ".socket"))
+    return candidates
+
+
+def _is_unix_socket(path):
+    """Prueft den Dateityp; Existenz allein reicht bei stale Pfaden nicht."""
+    try:
+        return stat.S_ISSOCK(os.stat(path).st_mode)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def discover_socket_with_paths(override=None):
+    """Findet einen echten Socket mit erfolgreichem REGISTER_PATH-Handshake.
+
+    Reihenfolge:
+      1. --socket / NCPIN_SOCKET (explizit gesetzt)
+      2. Team-präfixierter Group-Container (der Live-Socket des Clients): .../s
+      3. Legacy-Pfad ohne Team-Präfix: .../.socket
+
+    Explizite Pfade sind strikt: Ist ihr Socket stale oder antwortet nicht,
+    wird nicht auf einen automatisch gefundenen Kandidaten ausgewichen.
+    """
+    for candidate in _socket_candidates(override):
+        if not _is_unix_socket(candidate):
+            continue
+        roots = read_registered_paths(candidate)
+        if roots:
+            return candidate, roots
+    return None, []
+
+
+def discover_socket(override=None):
+    """Kompatibler Kurzweg: nur den verifizierten Socket-Pfad liefern."""
+    sock_path, _roots = discover_socket_with_paths(override)
+    return sock_path
+
+
+def installed_client_version():
+    """Version des installierten Nextcloud-Desktop-Clients oder None.
+
+    Liest CFBundleShortVersionString direkt aus der Info.plist des
+    App-Bundles, ohne den Client zu starten. plistlib gehört zur
+    Standardbibliothek und funktioniert im System-Python.
+    """
+    for app_dir in ("/Applications/Nextcloud.app",
+                    os.path.expanduser("~/Applications/Nextcloud.app")):
+        plist_path = os.path.join(app_dir, "Contents", "Info.plist")
+        try:
+            with open(plist_path, "rb") as fh:
+                info = plistlib.load(fh)
+        except (OSError, ValueError):
+            # App fehlt an diesem Ort oder die Plist ist unlesbar -> naechster.
+            continue
+        version = info.get("CFBundleShortVersionString")
+        if isinstance(version, str) and version:
+            return version
+    return None
+
+
+def socket_api_removed_hint():
+    """Erklärung, falls der installierte Client gar keine Socket-API mehr hat.
+
+    Der Desktop-Client 34.0.0 (Juli 2026) hat die lokale Socket-API auf
+    macOS ersatzlos entfernt: Der Finder spricht seitdem über XPC, und der
+    Client akzeptiert dort nur Prozesse mit Nextclouds eigener Team-ID.
+    ncpin kann sich mit so einem Client prinzipiell nicht mehr verbinden —
+    das ist dann keine Fehlkonfiguration, sondern eine Inkompatibilität.
+
+    Liefert den erklärenden Text oder None (Client unbekannt oder < 34).
+    """
+    version = installed_client_version()
+    if not version:
+        return None
+    try:
+        major = int(version.split(".")[0])
+    except ValueError:
+        return None
+    if major < 34:
+        return None
+    return ("Nextcloud-Client %s besitzt keine lokale Socket-API mehr "
+            "(seit v34 nur noch XPC für Nextcloud-eigene Prozesse). "
+            "ncpin kann mit dieser Client-Version nicht funktionieren; "
+            "letzte kompatible Version: 4.0.11." % version)
+
+
+def _connect(sock_path):
+    """Verbindet sich mit dem Unix-Socket, wirft bei Fehler."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    try:
+        s.connect(sock_path)
+    except OSError:
+        s.close()
+        raise
+    return s
+
+
+def _recv_burst(s, first_wait, sentinel=None):
+    """Liest die Server-Antwort von einem (frisch verbundenen) Socket.
+
+    Der Client antwortet als kurzer Burst und schweigt danach, haelt die
+    Verbindung aber offen. Darum NICHT auf ein festes Zeitfenster warten:
+      - auf das ERSTE Paket bis 'first_wait' Sekunden warten,
+      - danach je 'RECV_IDLE' Sekunden auf Nachzuegler; kommt nichts mehr
+        (socket.timeout), ist der Server fertig -> abbrechen,
+      - bei gesetztem 'sentinel' sofort abbrechen, sobald er im Puffer steht
+        (z.B. b"GET_MENU_ITEMS:END") -> spart die Idle-Wartezeit ganz.
+    'RECV_MAX' deckelt den Gesamt-Lesevorgang (Sicherheitsnetz gegen Haenger).
+    Gibt den Roh-Text (UTF-8, fehlertolerant) zurueck.
+    """
+    buf = b""
+    deadline = time.time() + RECV_MAX
+    first = True
+    while time.time() < deadline:
+        # erstes Paket darf laenger dauern (Client evtl. kurz beschaeftigt),
+        # danach reicht die kurze Idle-Luecke, um "fertig" zu erkennen.
+        s.settimeout(first_wait if first else RECV_IDLE)
+        try:
+            data = s.recv(65536)
+        except socket.timeout:
+            break
+        first = False
+        if not data:
+            break
+        buf += data
+        if sentinel and sentinel in buf:
+            break
+    return buf.decode("utf-8", "replace")
+
+
+def read_registered_paths(sock_path):
+    """Liest die REGISTER_PATH-Zeilen, die der Server beim Verbinden schickt.
+
+    Gibt die Liste der synchronisierten Wurzel-Ordner zurück (z.B.
+    ["/Users/.../Nextcloud"]). Damit prüfen wir, ob ein Zielpfad überhaupt
+    in einem Nextcloud-Ordner liegt.
+    """
+    paths = []
+    try:
+        s = _connect(sock_path)
+    except OSError:
+        return paths
+    try:
+        # Kein Sentinel: der Server markiert das Ende der REGISTER_PATH-Zeilen
+        # nicht. _recv_burst erkennt das Ende an der Idle-Luecke nach dem Burst
+        # (frueher blockierte hier ein zweites recv bis zum 3s-Socket-Timeout).
+        text = _recv_burst(s, HANDSHAKE_WAIT)
+        for line in text.splitlines():
+            if line.startswith("REGISTER_PATH:"):
+                registered = line[len("REGISTER_PATH:"):]
+                if registered:
+                    paths.append(registered)
+    finally:
+        s.close()
+    return paths
+
+
+def send_command(sock_path, command, read_secs=0.0):
+    """Schickt einen einzelnen Befehl und liest optional die Antwort.
+
+    read_secs=0 -> nur senden (für MAKE_*; der Server antwortet darauf nicht).
+    read_secs>0 -> Antwort lesen; read_secs ist die max. Wartezeit auf das ERSTE
+                   Antwort-Paket (danach uebernimmt die Idle-Logik in _recv_burst).
+                   Bei GET_MENU_ITEMS bricht der b"GET_MENU_ITEMS:END"-Sentinel
+                   sofort ab -> in der Praxis ~0,03s statt der vollen read_secs.
+    """
+    s = _connect(sock_path)
+    try:
+        s.sendall((command + "\n").encode("utf-8"))
+        if read_secs <= 0:
+            # Kurz warten, damit der Schreibpuffer sicher raus ist, dann zu.
+            time.sleep(0.15)
+            return ""
+        return _recv_burst(s, read_secs, sentinel=b"GET_MENU_ITEMS:END")
+    finally:
+        s.close()
+
+
+# ---------------------------------------------------------------------------
+# Pfad-Auflösung + Zustands-Abfrage
+# ---------------------------------------------------------------------------
+
+def resolve_ondisk(path):
+    """Findet den tatsächlichen On-Disk-Namen einer (evtl. virtuellen) Datei.
+
+    Der Nutzer tippt vielleicht "Foo.mp4", auf der Platte liegt aber
+    "Foo.mp4.nextcloud" (dehydriert) — oder umgekehrt. Wir probieren:
+      1. den Pfad selbst
+      2. Pfad + Suffix   (Nutzer meinte die virtuelle Datei, sie ist dehydriert)
+      3. Pfad − Suffix   (Nutzer gab den .nextcloud-Namen, Datei ist hydriert)
+    Gibt den existierenden Pfad zurück, sonst None.
+    """
+    p = os.path.abspath(os.path.expanduser(path))
+    if os.path.lexists(p):
+        return p
+    if os.path.lexists(p + SUFFIX):
+        return p + SUFFIX
+    if p.endswith(SUFFIX) and os.path.lexists(p[:-len(SUFFIX)]):
+        return p[:-len(SUFFIX)]
+    return None
+
+
+def parse_state(menu_text):
+    """Ermittelt den Ist-Pin-Zustand aus einer GET_MENU_ITEMS-Antwort.
+
+    Lokalisierungs-unabhängig: wir schauen NICHT auf die Labels, sondern darauf,
+    welche Aktion aktiv (klickbar) ist. Das Flag-Feld "d" bedeutet "disabled".
+      Format je Zeile: MENU_ITEM:<befehl>:<flags>:<titel>
+      - MAKE_AVAILABLE_LOCALLY aktiv  -> Datei ist gerade online-only  -> "online"
+      - MAKE_ONLINE_ONLY aktiv        -> Datei ist gerade lokal         -> "local"
+    """
+    avail_enabled = online_enabled = False
+    for line in menu_text.splitlines():
+        if not line.startswith("MENU_ITEM:"):
+            continue
+        parts = line.split(":")
+        # parts[1] = Befehl, parts[2] = Flags
+        if len(parts) < 3:
+            continue
+        cmd, flags = parts[1], parts[2]
+        enabled = "d" not in flags  # 'd' => disabled
+        if cmd == "MAKE_AVAILABLE_LOCALLY":
+            avail_enabled = enabled
+        elif cmd == "MAKE_ONLINE_ONLY":
+            online_enabled = enabled
+    if online_enabled and not avail_enabled:
+        return "local"
+    if avail_enabled and not online_enabled:
+        return "online"
+    return "unknown"
+
+
+def query_state(sock_path, ondisk_path, roots):
+    """Fragt den Pin-Zustand ab, nach erneutem Check der Sync-Grenze."""
+    ondisk_path = checked_path(ondisk_path, roots)
+    # read_secs ist nur noch die Wartezeit auf das ERSTE Paket; der
+    # GET_MENU_ITEMS:END-Sentinel beendet das Lesen real nach ~0,03s.
+    text = send_command(sock_path, "GET_MENU_ITEMS:" + ondisk_path, read_secs=1.0)
+    return parse_state(text)
+
+
+# ---------------------------------------------------------------------------
+# Aktionen
+# ---------------------------------------------------------------------------
+
+CMD_LOCAL = "MAKE_AVAILABLE_LOCALLY"   # hydrieren / "immer lokal" (pin)
+CMD_ONLINE = "MAKE_ONLINE_ONLY"        # dehydrieren / Speicher freigeben
+
+
+def do_action(sock_path, ondisk_path, target, roots):
+    """Schickt den Pin-Befehl nach erneutem Check der Sync-Grenze."""
+    ondisk_path = checked_path(ondisk_path, roots)
+    cmd = CMD_LOCAL if target == "local" else CMD_ONLINE
+    send_command(sock_path, cmd + ":" + ondisk_path, read_secs=0.0)
+
+
+def wait_for_state(sock_path, orig_path, target, timeout, roots):
+    """Pollt, bis der Zielzustand erreicht ist oder timeout abläuft.
+
+    Wichtig: beim Hydrieren/Dehydrieren ändert sich der On-Disk-Name (Suffix
+    kommt/geht), daher in jeder Runde neu auflösen.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        od = resolve_ondisk(orig_path)
+        if od is None:
+            time.sleep(0.5)
+            continue
+        st = query_state(sock_path, od, roots)
+        if st == target:
+            return True
+        time.sleep(0.5)
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+class PathOutsideRoots(ValueError):
+    """Ein aufgeloester Pfad liegt ausserhalb aller registrierten Syncwurzeln."""
+
+
+def canonical_path(path):
+    """Expandiert Nutzerpfade und loest Symlinks fuer Sicherheitsvergleiche."""
+    return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+
+
+def canonical_roots(roots):
+    """Kanonisiert und dedupliziert die vom Client registrierten Wurzeln."""
+    result = []
+    for root in roots:
+        canonical = canonical_path(root)
+        if canonical not in result:
+            result.append(canonical)
+    return result
+
+
+def in_any_folder(path, roots):
+    """True, wenn der reale Pfad in einer realen registrierten Wurzel liegt."""
+    candidate = canonical_path(path)
+    for root in roots:
+        canonical_root = canonical_path(root)
+        try:
+            if os.path.commonpath([candidate, canonical_root]) == canonical_root:
+                return True
+        except ValueError:
+            # Unterschiedliche Laufwerke/Pfadformen koennen keine Zugehoerigkeit
+            # bilden. Auf macOS selten, aber kontrolliert ablehnen statt crashen.
+            continue
+    return False
+
+
+def checked_path(path, roots):
+    """Liefert den kanonischen Pfad oder verweigert die Syncroot-Grenze."""
+    canonical = canonical_path(path)
+    if "\n" in canonical or "\r" in canonical:
+        raise PathOutsideRoots("Pfad enthaelt Zeilenumbruch")
+    if not in_any_folder(canonical, roots):
+        raise PathOutsideRoots("nicht in einem Nextcloud-Ordner")
+    return canonical
+
+
+def list_entries(folder, roots):
+    """Listet die sichtbaren Eintraege eines Ordners als logische Namen.
+
+    Fuer das Auswahlmenue der Toolbar-App (siehe README): der Nutzer klickt die
+    App in einem Nextcloud-Ordner an und bekommt dessen Inhalt zur Auswahl. Regeln:
+      - dehydrierte Platzhalter "<name>.nextcloud" werden auf "<name>" verkuerzt
+        (ncpin loest beim Pin-Befehl ohnehin beide Schreibweisen auf),
+      - versteckte Eintraege (".DS_Store", ".sync_*", …) fliegen raus,
+      - alphabetisch sortiert + dedupliziert.
+    Gibt eine Liste logischer Namen (ohne Pfad) zurueck.
+    """
+    # Unmittelbar vor dem Dateisystemzugriff erneut kanonisieren. Dadurch kann
+    # ein Symlink unterhalb der Syncwurzel nicht in ein fremdes Verzeichnis
+    # zeigen und dessen Namen ueber den Toolbar-Picker preisgeben.
+    folder = checked_path(folder, roots)
+    names = []
+    seen = set()
+    try:
+        entries = sorted(os.listdir(folder))
+    except OSError:
+        return names
+    for nm in entries:
+        if nm.startswith("."):
+            continue
+        logical = nm[:-len(SUFFIX)] if nm.endswith(SUFFIX) else nm
+        if logical and logical not in seen:
+            seen.add(logical)
+            names.append(logical)
+    return names
+
+
+def emit(results, as_json, quiet):
+    """Gibt die Ergebnisse aus (JSON oder menschenlesbar)."""
+    if as_json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+        return
+    if quiet:
+        return
+    labels = {"local": "lokal", "online": "online-only", "unknown": "unbekannt"}
+    for r in results:
+        if r.get("error"):
+            print("✗ %s — %s" % (r["path"], r["error"]))
+        elif r["op"] == "status":
+            print("%-12s %s" % (labels.get(r["state"], r["state"]), r["path"]))
+        else:
+            arrow = "→ lokal" if r["target"] == "local" else "→ online-only"
+            done = "" if not r.get("waited") else (" ✓" if r.get("reached") else " (Timeout)")
+            print("%s  %s%s" % (arrow, r["path"], done))
+
+
+COMMANDS = ("local", "online", "toggle", "status", "doctor", "list")
+FLAG_OPTIONS = ("--json", "-q", "--quiet", "--wait")
+VALUE_OPTIONS = ("--timeout", "--socket")
+
+
+def normalize_cli_argv(argv):
+    """Ordnet bekannte Optionen fuer argparse-Subparser kompatibel ein.
+
+    Apples Python 3.9 kann ``parse_intermixed_args`` nicht mit Subparsern
+    kombinieren. Darum werden Optionen vor bzw. zwischen Pfaden stabil vor die
+    Pfad-Positionals des gewaehlten Befehls geschoben. ``--`` bleibt die klare
+    Grenze fuer Pfade, die selbst mit einem Bindestrich beginnen.
+    """
+    original = list(argv)
+    before = []
+    global_options = []
+    command = None
+    index = 0
+
+    while index < len(original):
+        token = original[index]
+        if token in COMMANDS:
+            command = token
+            index += 1
+            break
+        if token in ("-h", "--help", "--version"):
+            global_options.append(token)
+            index += 1
+            continue
+        if token in FLAG_OPTIONS:
+            before.append(token)
+            index += 1
+            continue
+        if token in VALUE_OPTIONS:
+            before.append(token)
+            if index + 1 < len(original):
+                before.append(original[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if any(token.startswith(option + "=") for option in VALUE_OPTIONS):
+            before.append(token)
+            index += 1
+            continue
+        # Ein unbekanntes Token vor dem Subcommand soll argparse selbst mit
+        # Exit 2 melden; seine moegliche Arity duerfen wir hier nicht erraten.
+        return original
+
+    if command is None:
+        return original
+
+    options = []
+    paths = []
+    used_separator = False
+    while index < len(original):
+        token = original[index]
+        if token == "--":
+            used_separator = True
+            paths.extend(original[index + 1:])
+            break
+        if token == "--version":
+            global_options.append(token)
+            index += 1
+            continue
+        if token in FLAG_OPTIONS or token in ("-h", "--help"):
+            options.append(token)
+            index += 1
+            continue
+        if token in VALUE_OPTIONS:
+            options.append(token)
+            if index + 1 < len(original):
+                options.append(original[index + 1])
+                index += 2
+            else:
+                index += 1
+            continue
+        if any(token.startswith(option + "=") for option in VALUE_OPTIONS):
+            options.append(token)
+            index += 1
+            continue
+        if token.startswith("-"):
+            # Unbekannte Option bewusst beim Subparser lassen, damit sie vor
+            # jedem Socketzugriff als Aufruffehler endet.
+            options.append(token)
+        else:
+            paths.append(token)
+        index += 1
+
+    normalized = global_options + [command] + before + options
+    if used_separator:
+        normalized.append("--")
+    normalized.extend(paths)
+    return normalized
+
+
+def add_output_options(parser):
+    """Gemeinsame, tatsaechlich ausgewertete Ausgabe-/Socketoptionen."""
+    parser.add_argument("--json", action="store_true",
+                        help="maschinenlesbare JSON-Ausgabe")
+    parser.add_argument("-q", "--quiet", action="store_true",
+                        help="keine normale Ausgabe (nur Exit-Code)")
+    parser.add_argument("--socket", help="Socket-Pfad strikt ueberschreiben")
+
+
+def build_parser():
+    """Baut die exakte Befehlsgrammatik der CLI."""
+    ap = argparse.ArgumentParser(
+        prog="ncpin",
+        description="Nextcloud-VFS-Pin per Kommandozeile (am FinderSync-Menü vorbei).",
+        epilog="Beispiele:\n"
+               "  ncpin local  ~/Nextcloud/Film.mp4        # lokal holen (hydrieren)\n"
+               "  ncpin online ~/Nextcloud/Film.mp4        # Speicher freigeben\n"
+               "  ncpin toggle ~/Nextcloud/Ordner          # umschalten (rekursiv)\n"
+               "  ncpin status --json ~/Nextcloud/*.pdf    # Zustand maschinenlesbar\n"
+               "  ncpin list   ~/Nextcloud/Ordner          # Ordnerinhalt (logische Namen)\n"
+               "  ncpin doctor                             # Client/Socket prüfen",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument("--version", action="version", version="ncpin 1.1.0")
+    ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
+                    wait=False, timeout=30.0)
+    subparsers = ap.add_subparsers(dest="command", required=True)
+
+    for command in ("local", "online", "toggle"):
+        command_parser = subparsers.add_parser(command)
+        add_output_options(command_parser)
+        command_parser.add_argument("--wait", action="store_true",
+                                    help="bis zum Zielzustand warten")
+        command_parser.add_argument(
+            "--timeout", type=float, default=30.0, metavar="SEK",
+            help="max. Wartezeit fuer --wait (Standard 30s)")
+        command_parser.add_argument(
+            "paths", nargs="+",
+            help="Datei(en)/Ordner im Nextcloud-Ordner")
+
+    status_parser = subparsers.add_parser("status")
+    add_output_options(status_parser)
+    status_parser.add_argument(
+        "paths", nargs="+", help="Datei(en)/Ordner im Nextcloud-Ordner")
+
+    doctor_parser = subparsers.add_parser("doctor")
+    add_output_options(doctor_parser)
+
+    list_parser = subparsers.add_parser("list")
+    add_output_options(list_parser)
+    list_parser.add_argument(
+        "paths", nargs=1, metavar="PFAD",
+        help="genau ein Ordner im Nextcloud-Ordner")
+    return ap
+
+
+def main(argv):
+    ap = build_parser()
+    args = ap.parse_args(normalize_cli_argv(argv))
+
+    sock, discovered_roots = discover_socket_with_paths(args.socket)
+
+    # doctor: Diagnose ohne Pfade
+    if args.command == "doctor":
+        roots = canonical_roots(discovered_roots)
+        # Ohne Socket den plausibelsten Grund gleich mitliefern: Ab Client v34
+        # gibt es die Socket-API auf macOS nicht mehr (siehe Helfer oben).
+        removed_hint = None if sock else socket_api_removed_hint()
+        info = {
+            "socket": sock,
+            "socket_ok": bool(sock),
+            "client_responds": bool(roots),
+            "registered_folders": roots,
+            "suffix": SUFFIX,
+            "client_app_version": installed_client_version(),
+            "socket_api_removed": bool(removed_hint),
+        }
+        if args.json:
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+        elif not args.quiet:
+            print("Socket:           %s" % (sock or "NICHT gefunden"))
+            print("Client antwortet: %s" % ("ja" if roots else "nein"))
+            print("Sync-Ordner:      %s" % (", ".join(roots) if roots else "—"))
+            print("Suffix:           %s" % SUFFIX)
+            print("Client-Version:   %s" % (info["client_app_version"] or "unbekannt"))
+        if not sock:
+            if removed_hint:
+                sys.stderr.write("Fehler: %s\n" % removed_hint)
+            else:
+                sys.stderr.write("Fehler: kein Nextcloud-Socket gefunden.\n")
+            return 1
+        if not roots:
+            sys.stderr.write("Fehler: Client antwortet nicht (läuft Nextcloud?).\n")
+            return 1
+        return 0
+
+    if not sock:
+        removed_hint = socket_api_removed_hint()
+        if removed_hint:
+            sys.stderr.write("Fehler: %s\n" % removed_hint)
+        else:
+            sys.stderr.write("Fehler: kein Nextcloud-Socket gefunden — läuft der Client?\n")
+        return 1
+
+    roots = canonical_roots(discovered_roots)
+    if not roots:
+        sys.stderr.write("Fehler: Nextcloud-Client antwortet nicht (läuft er?).\n")
+        return 1
+
+    # list: Inhalt EINES Ordners auflisten (fuer das Auswahlmenue der Toolbar-App).
+    # Eigener Zweig, weil die Ausgabe anders aussieht (viele Namen statt 1 Zustand
+    # pro Pfad). Reiner Filesystem-Lesevorgang, kein Socket-Befehl noetig.
+    if args.command == "list":
+        raw = args.paths[0]
+        if not in_any_folder(raw, roots):
+            sys.stderr.write("Fehler: nicht in einem Nextcloud-Ordner.\n")
+            return 3
+        folder = resolve_ondisk(raw)
+        if folder is None:
+            sys.stderr.write("Fehler: Ordner nicht gefunden.\n")
+            return 3
+        try:
+            folder = checked_path(folder, roots)
+            if not os.path.isdir(folder):
+                sys.stderr.write("Fehler: Ordner nicht gefunden.\n")
+                return 3
+            names = list_entries(folder, roots)
+        except PathOutsideRoots:
+            sys.stderr.write("Fehler: nicht in einem Nextcloud-Ordner.\n")
+            return 3
+        if args.json:
+            print(json.dumps({"folder": folder, "entries": names},
+                             ensure_ascii=False, indent=2))
+        elif not args.quiet:
+            # eine logische Bezeichnung je Zeile -> direkt von AppleScript
+            # (paragraphs of) bzw. Skripten weiterverarbeitbar.
+            for n in names:
+                print(n)
+        return 0
+
+    results = []
+    exit_code = 0
+
+    for raw in args.paths:
+        # Pfad muss in einem Nextcloud-Ordner liegen — sonst nichts anfassen.
+        if not in_any_folder(raw, roots):
+            results.append({"path": raw, "op": args.command,
+                            "error": "nicht in einem Nextcloud-Ordner"})
+            exit_code = 3
+            continue
+
+        ondisk = resolve_ondisk(raw)
+        if ondisk is None:
+            results.append({"path": raw, "op": args.command,
+                            "error": "Datei nicht gefunden"})
+            exit_code = 3
+            continue
+
+        try:
+            ondisk = checked_path(ondisk, roots)
+        except PathOutsideRoots as e:
+            results.append({"path": raw, "op": args.command,
+                            "error": str(e)})
+            exit_code = 3
+            continue
+
+        try:
+            if args.command == "status":
+                state = query_state(sock, ondisk, roots)
+                results.append({"path": ondisk, "op": "status", "state": state})
+                continue
+
+            # Zielzustand bestimmen
+            if args.command == "local":
+                target = "local"
+            elif args.command == "online":
+                target = "online"
+            else:  # toggle
+                cur = query_state(sock, ondisk, roots)
+                if cur == "unknown":
+                    # Zustand nicht ermittelbar (z.B. Client im Fehlerzustand) —
+                    # lieber Fehler melden als blind hydrieren oder dehydrieren.
+                    results.append({"path": ondisk, "op": args.command,
+                                     "error": "Zustand nicht ermittelbar (toggle abgebrochen)"})
+                    exit_code = 1
+                    continue
+                target = "online" if cur == "local" else "local"
+
+            do_action(sock, ondisk, target, roots)
+            rec = {"path": ondisk, "op": args.command, "target": target}
+
+            if args.wait:
+                reached = wait_for_state(sock, raw, target, args.timeout, roots)
+                rec["waited"] = True
+                rec["reached"] = reached
+                if not reached:
+                    exit_code = 1
+            results.append(rec)
+        except PathOutsideRoots as e:
+            # Der Pfad kann sich zwischen Aufloesung und Socketoperation aendern
+            # (z.B. ausgetauschter Symlink). Auch dann Exit 3 und kein MAKE.
+            results.append({"path": ondisk, "op": args.command,
+                            "error": str(e)})
+            exit_code = 3
+        except OSError as e:
+            # Verbindungsabbruch waehrend der Verarbeitung: sauberen Fehlereintrag
+            # anhaengen und naechsten Pfad verarbeiten statt mit Traceback abzubrechen.
+            results.append({"path": ondisk, "op": args.command,
+                             "error": "Socket-Fehler: %s" % e})
+            exit_code = 1
+
+    emit(results, args.json, args.quiet)
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

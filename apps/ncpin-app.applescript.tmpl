@@ -1,0 +1,175 @@
+-- ncpin-App — Nextcloud-VFS-Pin per Klick.
+--
+-- Diese Vorlage wird von install.sh zu zwei Apps gebaut:
+--   "Lokal halten"      (@@ACTION@@ = local)
+--   "Speicher freigeben"(@@ACTION@@ = online)
+-- @@ACTION@@/@@LABEL@@/@@NCPIN_PATH@@ werden beim Bauen ersetzt.
+--
+-- Zwei Bedienarten:
+--   1. Droplet: Datei(en)/Ordner aus dem Finder auf die App ziehen.
+--   2. Toolbar/Klick: App in die Finder-Toolbar ziehen; ein Klick wirkt auf...
+--      a) die aktuelle Finder-Auswahl, falls etwas markiert ist (schneller Pfad);
+--      b) sonst oeffnet sich ein Auswahlmenue mit dem Inhalt des aktuellen
+--         Finder-Fensters (Mehrfachauswahl, OK/Abbrechen, Esc = Abbrechen).
+--      So braucht man kein Drag&Drop und riskiert nicht, beim Verfehlen des Icons
+--      versehentlich einen Ordner zu verschieben.
+--
+property ncAction : "@@ACTION@@"   -- "local" oder "online"
+property ncLabel : "@@LABEL@@"     -- Anzeigetext für Meldungen
+property ncpinExecutable : @@NCPIN_PATH@@
+
+-- Absoluter Pfad zur ncpin-CLI, vom Installer sicher in die Vorlage eingesetzt.
+on ncpinPath()
+	return ncpinExecutable
+end ncpinPath
+
+-- ncpin mit einer Liste von POSIX-Pfaden aufrufen.
+on runNcpin(posixPaths)
+	if posixPaths is {} then
+		return
+	end if
+	set ncpin to my ncpinPath()
+	set argline to ""
+	repeat with p in posixPaths
+		set argline to argline & " " & quoted form of (p as text)
+	end repeat
+	-- ncpin normalisiert Optionen fuer Apples System-Python 3.9 und akzeptiert
+	-- --wait vor, zwischen oder nach den Pfaden. Die Position am Ende bleibt fuer
+	-- alte lokale Installationen kompatibel.
+	set cmd to quoted form of ncpin & " " & ncAction & argline & " --wait"
+	try
+		set out to do shell script cmd
+		display notification ((count of posixPaths) as text) & " Objekt(e): " & ncLabel with title "Nextcloud"
+	on error errMsg number errNum
+		display dialog "ncpin Fehler (" & errNum & "):" & return & errMsg buttons {"OK"} default button "OK" with icon stop
+	end try
+end runNcpin
+
+-- Dateien auf die App gezogen
+on open theItems
+	set ps to {}
+	repeat with f in theItems
+		set end of ps to POSIX path of f
+	end repeat
+	my runNcpin(ps)
+end open
+
+-- App angeklickt (z.B. aus der Finder-Toolbar).
+--   Schneller Pfad: gibt es eine Finder-Auswahl -> die nehmen.
+--   Sonst: Auswahlmenue aus dem Inhalt des vordersten Finder-Fensters.
+on run
+	set selectionResult to my finderSelection()
+	set selectionStatus to item 1 of selectionResult
+	set ps to item 2 of selectionResult
+	if selectionStatus is "empty" then
+		-- Nur eine tatsaechlich leere Auswahl darf einen zweiten Finder-Zugriff
+		-- fuer den Ordner-Picker ausloesen. Fehler werden direkt erklaert.
+		set ps to my pickFromFrontWindow()
+	else if selectionStatus is not "ok" then
+		my showFinderProblem(selectionStatus)
+		return
+	end if
+	if ps is {} then
+		-- nichts zu tun (kein Fenster/leer oder Abbrechen/Esc) -> still beenden
+		return
+	end if
+	my runNcpin(ps)
+end run
+
+-- Erklaert Finder-Fehler mit einem nutzbaren CLI-/Droplet-Fallback.
+on showFinderProblem(problemKind)
+	if problemKind is "denied" then
+		display dialog "Finder-Zugriff wurde verweigert." & return & return & "Erlaube der App unter Systemeinstellungen > Datenschutz & Sicherheit > Automation den Finder-Zugriff. Alternativ nutze die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
+	else if problemKind is "timeout" then
+		display dialog "Der Finder antwortet nicht innerhalb von 5 Sekunden." & return & return & "Versuche es nach einem Finder-Neustart erneut. Bis dahin kannst du die ncpin-CLI nutzen oder Objekte direkt auf die App ziehen." buttons {"OK"} default button "OK" with icon caution
+	else if problemKind is "no-window" then
+		display dialog "Kein Finder-Fenster offen." & return & return & "Oeffne einen Nextcloud-Ordner. Alternativ nutze die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
+	else
+		display dialog "Der Finder konnte nicht gelesen werden." & return & return & "Nutze vorerst die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
+	end if
+end showFinderProblem
+
+-- Aktuelle Finder-Auswahl als {Status, POSIX-Pfade}. Status ist "ok", "empty",
+-- "denied", "timeout" oder "error". Nur "empty" erlaubt den Picker-Fallback.
+on finderSelection()
+	set ps to {}
+	try
+		-- Kurzer Timeout: auf manchen Macs beantwortet der Finder keine
+		-- AppleEvents (Timeout -1712). Der strukturierte Fehler verhindert,
+		-- dass der Aufrufer danach noch einen zweiten Finder-Zugriff startet.
+		with timeout of 5 seconds
+			tell application "Finder"
+				set theSel to selection as alias list
+			end tell
+		end timeout
+	on error errMsg number errNum
+		if errNum is -1743 then return {"denied", {}}
+		if errNum is -1712 then return {"timeout", {}}
+		return {"error", {}}
+	end try
+	repeat with f in theSel
+		set end of ps to POSIX path of f
+	end repeat
+	if ps is {} then return {"empty", {}}
+	return {"ok", ps}
+end finderSelection
+
+-- Ergebnis fuer den Ordner des vordersten Finder-Fensters: {Status, Pfad}.
+-- Genau EIN AppleEvent -> minimiert die -1712-Angriffsflaeche.
+on frontWindowFolder()
+	set p to ""
+	try
+		with timeout of 5 seconds
+			tell application "Finder"
+				set t to target of front window
+				set p to POSIX path of (t as alias)
+			end tell
+		end timeout
+	on error errMsg number errNum
+		if errNum is -1743 then return {"denied", ""}
+		if errNum is -1712 then return {"timeout", ""}
+		if errNum is -1728 then return {"no-window", ""}
+		return {"error", ""}
+	end try
+	return {"ok", p}
+end frontWindowFolder
+
+-- Auswahlmenue aus dem Inhalt des vordersten Finder-Fensters.
+-- Liefert die gewaehlten POSIX-Pfade ({} bei Abbruch/Esc/leer/Fehler).
+on pickFromFrontWindow()
+	set folderResult to my frontWindowFolder()
+	set folderStatus to item 1 of folderResult
+	if folderStatus is not "ok" then
+		my showFinderProblem(folderStatus)
+		return {}
+	end if
+	set folderPath to item 2 of folderResult
+	-- Inhalt vom ncpin selbst listen lassen ('ncpin list'): das strippt den
+	-- .nextcloud-Suffix fuer die Anzeige und kennt den Nextcloud-Ordner-Guard.
+	-- Eine logische Bezeichnung je Zeile -> 'paragraphs of'.
+	set ncpin to my ncpinPath()
+	set rawList to ""
+	try
+		set rawList to do shell script quoted form of ncpin & " list " & quoted form of folderPath
+	on error errMsg number errNum
+		-- errMsg enthaelt die Original-Fehlermeldung von ncpin (z.B. "Ordner nicht gefunden"
+		-- oder "nicht in einem Nextcloud-Ordner"), daher direkt anzeigen statt pauschale Meldung.
+		display dialog errMsg buttons {"OK"} default button "OK" with icon caution
+		return {}
+	end try
+	if rawList is "" then
+		display notification "Ordner ist leer." with title "Nextcloud"
+		return {}
+	end if
+	set dispNames to paragraphs of rawList
+	set chosen to (choose from list dispNames with prompt (ncLabel & " — Objekte im Ordner waehlen:") with multiple selections allowed without empty selection allowed)
+	if chosen is false then
+		-- Abbrechen oder Esc
+		return {}
+	end if
+	set ps to {}
+	repeat with nm in chosen
+		set end of ps to folderPath & "/" & (nm as text)
+	end repeat
+	return ps
+end pickFromFrontWindow
