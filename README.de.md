@@ -4,15 +4,17 @@
 
 Nextcloud-VFS-Pin per Kommandozeile setzen — **am kaputten Finder-Menü vorbei.**
 
-> **⚠️ Funktioniert nicht mit Nextcloud-Desktop-Client 34 oder neuer.**
+> **ℹ️ Client v34 hat den Unterbau ausgetauscht — ncpin 1.2 passt sich automatisch an.**
 > Client v34.0.0 (erschienen 2026-07-28) hat die lokale Socket-API auf macOS entfernt
-> ([socketapi.cpp](https://github.com/nextcloud/desktop/blob/master/src/gui/socketapi/socketapi.cpp)):
-> Die Finder-Integration läuft seitdem über XPC, und der Client akzeptiert dort nur Verbindungen
-> von Prozessen mit Nextclouds eigener Team-ID. ncpin baut vollständig auf diesem Socket auf und
-> **kann mit Client v34+ nicht funktionieren** — es gibt keine Einstellung, die den Socket
-> zurückbringt. Die letzte kompatible Client-Version ist
-> **[v4.0.11](https://github.com/nextcloud/desktop/releases/tag/v4.0.11)**.
-> `ncpin doctor` erkennt diesen Fall und meldet ihn ausdrücklich.
+> ([PR #9463](https://github.com/nextcloud/desktop/pull/9463)): Die Finder-Integration läuft
+> seitdem über XPC, und der Client akzeptiert dort nur Prozesse mit Nextclouds eigener Team-ID —
+> ncpins ursprünglicher Transport war damit weg, ohne Einstellung, die ihn zurückbringt.
+> Seit **ncpin 1.2** nutzt das Werkzeug auf v34+ deshalb einen zweiten Transport: Die Sync-Engine
+> selbst nimmt Pin-Wünsche im suffix-Modus als **Datei-Umbenennungen** entgegen
+> ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stable-34.0/src/libsync/discovery.cpp):
+> *„A suffix vfs file can be downloaded by renaming it to remove the suffix"* — und die
+> Gegenrichtung löst die Dehydrierung aus). Clients bis v33 laufen weiter über den klassischen
+> Socket; `ncpin doctor` zeigt den aktiven Transport an.
 
 Setzt für Dateien/Ordner im Nextcloud-Sync-Ordner den Pin-Zustand:
 
@@ -25,9 +27,20 @@ Der Nextcloud-Client bietet diese Aktionen normalerweise im Finder-Rechtsklick �
 **FinderSync-Extension** an. Auf manchen macOS-Versionen (beobachtet: macOS 26.x mit Nextcloud
 33.0.5) lässt sich diese Extension nicht dauerhaft aktivieren — das Menü fehlt dann komplett.
 
-ncpin umgeht das: Die Extension ist nur ein Bote. Die eigentliche Arbeit macht der **laufende
-Client über einen lokalen Unix-Socket**. ncpin spricht diesen Socket direkt an — exakt dieselben
-Befehle (`MAKE_AVAILABLE_LOCALLY` / `MAKE_ONLINE_ONLY`), die auch die Extension schicken würde.
+ncpin umgeht das: Die Extension ist nur ein Bote. Je nach Client-Version nutzt ncpin einen von
+zwei Transporten (automatisch gewählt):
+
+- **Socket-Transport (Client bis v33):** Der laufende Client bietet einen lokalen Unix-Socket an;
+  ncpin schickt exakt dieselben Befehle (`MAKE_AVAILABLE_LOCALLY` / `MAKE_ONLINE_ONLY`), die auch
+  die Extension schicken würde.
+- **Rename-Transport (Client v34+):** v34 hat diesen Socket entfernt. Die Sync-Engine liest
+  Pin-Wünsche im suffix-Modus aber weiterhin aus dem Dateisystem: `datei.pdf.nextcloud` →
+  `datei.pdf` umbenennen lässt den Client die Datei herunterladen; die Gegenrichtung dehydriert
+  sie. ncpin führt genau diese Umbenennungen aus, liest den Zustand direkt vom Dateisystem, holt
+  die Syncwurzeln aus der `nextcloud.cfg` des Clients und prüft vor einer Dehydrierung gegen das
+  Sync-Journal, dass die Datei fertig gesynct ist (sonst würde die Engine den Wunsch still
+  ignorieren).
+
 Solange der Nextcloud-Client läuft, funktioniert ncpin — Extension hin oder her.
 
 ## Installation
@@ -89,7 +102,7 @@ ncpin local  ~/Nextcloud/Film.mp4       # lokal holen (hydrieren)
 ncpin online ~/Nextcloud/Film.mp4       # Speicher freigeben (dehydrieren)
 ncpin toggle ~/Nextcloud/Ordner         # umschalten (Ordner = rekursiv)
 ncpin status ~/Nextcloud/Film.mp4       # aktuellen Zustand zeigen
-ncpin doctor                            # Client/Socket/Sync-Ordner prüfen
+ncpin doctor                            # Client/Transport/Sync-Ordner prüfen
 
 ncpin local --wait ~/Nextcloud/Film.mp4 # blockiert, bis Zustand erreicht
 ncpin status --json ~/Nextcloud/*.pdf   # JSON je Pfad
@@ -97,8 +110,8 @@ ncpin status --json ~/Nextcloud/*.pdf   # JSON je Pfad
 
 `local`, `online` und `toggle` verlangen mindestens einen Pfad und erlauben `--wait`/`--timeout`;
 `status` verlangt mindestens einen Pfad, `list` genau einen und `doctor` keinen. Falsche Arity oder
-Optionen enden mit Exit 2, bevor ein Socket geöffnet wird. Optionen dürfen auch zwischen mehreren
-Pfaden stehen (macOS-System-Python eingeschlossen).
+Optionen enden mit Exit 2, bevor irgendein Transport angefasst wird. Optionen dürfen auch zwischen
+mehreren Pfaden stehen (macOS-System-Python eingeschlossen).
 
 Der Datei-Suffix wird automatisch aufgelöst: egal ob du `Film.mp4` oder den Platzhalter
 `Film.mp4.nextcloud` angibst.
@@ -108,7 +121,7 @@ Der Datei-Suffix wird automatisch aufgelöst: egal ob du `Film.mp4` oder den Pla
 | Code | Bedeutung |
 |------|-----------|
 | 0 | ok |
-| 1 | Laufzeitfehler (Client läuft nicht / kein Socket / `--wait`-Timeout) |
+| 1 | Laufzeitfehler (Client läuft nicht / kein Transport / noch nicht gesynct / `--wait`-Timeout) |
 | 2 | Aufruf-Fehler (falsche Argumente) |
 | 3 | ein/mehrere Pfade nicht gefunden oder nicht in einem Nextcloud-Ordner |
 
@@ -131,8 +144,10 @@ $ ncpin status --json ~/Nextcloud/Beispiele/Nextcloud\ intro.mp4
 
 - `NCPIN_SUFFIX` — Platzhalter-Suffix (Standard `.nextcloud`; ownCloud: `.owncloud`)
 - `NCPIN_SOCKET` — Socket-Pfad strikt vorgeben. Ein stale Override erzeugt einen Fehler und fällt
-  nicht auf einen anderen Socket zurück. Die automatische Suche akzeptiert nur Unix-Sockets, die
-  mit mindestens einem `REGISTER_PATH` antworten.
+  weder auf einen anderen Socket **noch auf den Rename-Transport** zurück. Die automatische Suche
+  akzeptiert nur Unix-Sockets, die mit mindestens einem `REGISTER_PATH` antworten.
+- `NCPIN_CONFIG` — Pfad der Client-Konfiguration (`nextcloud.cfg`) strikt vorgeben, aus der der
+  Rename-Transport seine Syncwurzeln liest (vor allem für Tests).
 
 ## Nutzung im Finder
 
@@ -169,6 +184,8 @@ Erweiterungen → Erweiterungen → Finder → Häkchen prüfen, danach `killall
 
 ## Wie es funktioniert
 
+### Socket-Transport (Client bis v33)
+
 Der Client hört auf einem Unix-Socket im App-Group-Container:
 
 ```
@@ -186,6 +203,29 @@ MAKE_ONLINE_ONLY:<pfad>                     # dehydrieren / Speicher freigeben
 
 Den Ist-Zustand liest ncpin lokalisierungs-unabhängig daran ab, welche Menü-Aktion gerade
 aktiv (nicht ausgegraut) ist.
+
+### Rename-Transport (Client v34+)
+
+Client v34 hat die Socket-API auf macOS entfernt; der XPC-Ersatz akzeptiert nur Nextclouds eigene
+signierte Prozesse. ncpin steuert die Sync-Engine deshalb über die Mechanik, die sie für den
+suffix-Modus eingebaut hat ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stable-34.0/src/libsync/discovery.cpp)):
+
+- **hydrieren:** `datei.pdf.nextcloud` → `datei.pdf` umbenennen (ein einfaches `os.rename` erhält
+  Inode und mtime — genau das prüft die Engine); der Dateiwächter des Clients bemerkt es und lädt
+  den Inhalt herunter;
+- **dehydrieren:** `datei.pdf` → `datei.pdf.nextcloud` umbenennen — der Client ersetzt den Inhalt
+  durch einen 1-Byte-Platzhalter. Die Engine akzeptiert das nur, wenn Größe und mtime noch zum
+  Sync-Journal passen; ncpin prüft das deshalb **vorher** (gegen einen APFS-Klon des Journals, da
+  der laufende Client die SQLite-Datei exklusiv sperrt) und lehnt mit klarem Fehler ab, statt eine
+  still ignorierte Umbenennung zu hinterlassen;
+- **Zustand:** direkt aus dem Dateisystem — ein Platzhalter ist `<name>.nextcloud` mit exakt
+  1 Byte (dieselbe Heuristik verwendet die Engine selbst);
+- **Syncwurzeln:** aus der `nextcloud.cfg` des Clients (Ordner mit `virtualFilesMode=suffix`);
+  es gelten dieselben Pfadgrenzen-Prüfungen wie beim Socket-Transport;
+- **Ordner:** rekursiert ncpin selbst, Datei für Datei.
+
+Von der Engine geerbter Grenzfall: Eine echte 1-Byte-Datei ist von einem frischen Platzhalter
+nicht unterscheidbar und wird als `online` gemeldet.
 
 ## Tests / Latenz-Benchmark
 
@@ -206,28 +246,31 @@ Datei-Fixture innerhalb einer registrierten Syncwurzel. Der Benchmark liest den 
 prüft jeden Einzellauf und stellt den verifizierten Zustand auch nach einem Fehler im `finally`
 wieder her. Ohne sicher ermittelbaren Zustand führt er keine blinde Gegenoperation aus.
 
-Die deterministische Suite (Fake-Socket, Parser, Benchmark und isolierter Installer) läuft mit:
+Die deterministische Suite (Fake-Socket, Rename-Transport, Parser, Benchmark und isolierter
+Installer) läuft mit:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Exit-Codes: `0` Gate grün · `1` Overhead über Schwelle (Standard 1,0 s) oder falscher Zustand ·
-`2` Voraussetzung fehlt (kein Client/Socket — `ncpin doctor` muss zuerst grün sein).
+`2` Voraussetzung fehlt (kein Client/Transport — `ncpin doctor` muss zuerst grün sein).
 
 ## Voraussetzungen
 
-- macOS, laufender Nextcloud-Desktop-Client **bis v4.0.11** (v34+ hat die Socket-API entfernt,
-  siehe Hinweis ganz oben) mit Sync-Ordner im **Virtual-Files-Modus** (`suffix`)
+- macOS, laufender Nextcloud-Desktop-Client mit Sync-Ordner im **Virtual-Files-Modus** (`suffix`).
+  Clients bis v33 steuert ncpin über die Socket-API, v34+ über den Rename-Transport.
 - python3 ≥ 3.7 — keine externen Abhängigkeiten. Das mit macOS gelieferte System-Python
   (`/usr/bin/python3`) reicht; die Droplet-Apps rufen genau dieses auf.
 - Sicherheits-Guard: ncpin fasst nur reale, symlink-aufgelöste Pfade **innerhalb** eines
-  registrierten Nextcloud-Ordners an und prüft diese Grenze unmittelbar vor Datei-/Socketzugriffen.
+  registrierten Nextcloud-Ordners an und prüft diese Grenze unmittelbar vor Datei-/Transport-
+  Zugriffen.
 
 ## Multi-Mac
 
 Keine fest verdrahteten Benutzer- oder Repo-Pfade: Die Apps enthalten den tatsächlichen Pfad der
-installierten CLI sicher gequotet. Pro Mac einmal `./install.sh`; der Socket wird dynamisch geprüft.
+installierten CLI sicher gequotet. Pro Mac einmal `./install.sh`; der aktive Transport wird
+dynamisch erkannt.
 
 ## Lizenz
 

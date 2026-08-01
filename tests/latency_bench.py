@@ -162,17 +162,20 @@ def validate_measurement(name, measurement):
 # ---------------------------------------------------------------------------
 
 def check_doctor(runner):
-    """Prueft per `ncpin doctor --json`, ob Socket + Client bereit sind.
+    """Prueft per `ncpin doctor --json`, ob Transport + Client bereit sind.
 
     Gibt (ok, info_dict). Nutzt denselben Interpreter wie die Messung — so faellt
     auch ein interpreter-spezifisches Problem (z.B. 3.9.6) sofort auf.
+    "backend_ok" deckt beide Transporte (Socket bis v33, Rename ab v34);
+    der Fallback auf "socket_ok" laesst den Bench gegen ein aelteres ncpin laufen.
     """
     dt, rc, out, err = run_ncpin(runner, ["doctor", "--json"])
     try:
         info = json.loads(out)
     except (ValueError, json.JSONDecodeError):
         return False, {"error": "doctor lieferte kein JSON", "stderr": err.strip()}
-    ok = bool(info.get("socket_ok")) and bool(info.get("client_responds"))
+    backend_ok = info.get("backend_ok", info.get("socket_ok"))
+    ok = bool(backend_ok) and bool(info.get("client_responds"))
     return ok, info
 
 

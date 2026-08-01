@@ -35,12 +35,16 @@ AGENTS enthält Dauerverträge. Gerätestatus, frühere Defekte, Messhistorie,
 konkrete Zertifikate, Profile und Veröffentlichungspläne gehören in Changelog,
 Issue/Task oder lokale Konfiguration.
 
-## Socket- und Zustandsvertrag
+## Transport- und Zustandsvertrag
 
-Der Nextcloud-Client registriert Syncwurzeln über einen Unix-Socket im
-App-Group-Container. Der Pfad kann je Clientversion variieren und wird dynamisch
-gefunden; `NCPIN_SOCKET` darf ihn für Tests überschreiben. Das zeilenbasierte
-UTF-8-Protokoll verwendet insbesondere:
+ncpin wählt den Transport automatisch und strikt: ein explizit gesetzter Socket
+(`--socket`/`NCPIN_SOCKET`) fällt nie auf den Rename-Transport zurück, sonst
+arbeiten Fixture-Tests still auf der echten Client-Konfiguration.
+
+**Socket-Transport (Client bis v33).** Der Client registriert Syncwurzeln über
+einen Unix-Socket im App-Group-Container. Der Pfad kann je Clientversion
+variieren und wird dynamisch gefunden; `NCPIN_SOCKET` darf ihn für Tests
+überschreiben. Das zeilenbasierte UTF-8-Protokoll verwendet insbesondere:
 
 - `REGISTER_PATH:<root>`: registrierte Syncwurzel;
 - `GET_MENU_ITEMS:<path>`: verfügbare Aktionen und damit Istzustand;
@@ -55,12 +59,35 @@ Der Zustand wird lokalisierungsunabhängig aus den Command-IDs und Disabled-Flag
 bestimmt, nicht aus übersetzten Menütiteln. Parser müssen unvollständige Bursts,
 zusätzliche Menüpunkte und fehlende Endmarken kontrolliert behandeln.
 
+**Rename-Transport (Client v34+).** v34 hat die Socket-API auf macOS entfernt
+(XPC nur für Nextcloud-signierte Prozesse). Die Sync-Engine akzeptiert
+Pin-Wünsche im suffix-Modus als Umbenennungen (nextcloud/desktop,
+`src/libsync/discovery.cpp`): Suffix entfernen = Download, Suffix anhängen =
+Dehydrierung. Verträge dieses Transports:
+
+- Syncwurzeln kommen aus der `nextcloud.cfg` (nur Ordner mit
+  `virtualFilesMode=suffix`); `NCPIN_CONFIG` überschreibt den Pfad für Tests.
+- Zustand kommt direkt vom Dateisystem: Platzhalter = Suffix + exakt 1 Byte —
+  dieselbe Heuristik wie in der Engine; eine echte 1-Byte-Datei meldet
+  dadurch `online` (geerbter Grenzfall).
+- Die Engine akzeptiert eine Dehydrierungs-Umbenennung nur, wenn Größe und
+  mtime zum Sync-Journal passen, und ignoriert sie sonst still. ncpin prüft
+  das vorher gegen einen APFS-Klon des Journals (`cp -c`; der laufende Client
+  sperrt die SQLite mit `locking_mode=EXCLUSIVE`, Direktlesen scheitert) und
+  lehnt sonst mit klarem Fehler ab. Nie ungeprüft umbenennen.
+- Umbenennungen sind fire-and-forget wie MAKE-Befehle; den Sync stößt der
+  Dateiwächter des Clients an. `--wait` pollt den Dateisystem-Zustand.
+- Ordner rekursiert ncpin selbst (der Client übernahm das früher); Symlinks
+  und versteckte Einträge werden übersprungen.
+- Aktionen verlangen einen laufenden Client-Prozess (sonst Exit 1), Statuslesen
+  nicht.
+
 ## Sicherheitsgrenze: nur registrierte Syncwurzeln
 
-Jeder zustandsändernde Pfad muss innerhalb einer vom laufenden Client
-registrierten Syncwurzel liegen. Symlinks, `..`, Suffixauflösung und mehrere
-Wurzeln dürfen diese Grenze nicht umgehen. Außerhalb: klarer Fehler, keine
-Socketaktion.
+Jeder zustandsändernde Pfad muss innerhalb einer registrierten Syncwurzel
+liegen (Socket: `REGISTER_PATH`; Rename: suffix-Ordner der `nextcloud.cfg`).
+Symlinks, `..`, Suffixauflösung und mehrere Wurzeln dürfen diese Grenze nicht
+umgehen. Außerhalb: klarer Fehler, keine Transportaktion.
 
 Im `suffix`-VFS-Modus liegt ein online-only Platzhalter als
 `<name>.nextcloud`; ownCloud kann einen anderen Suffix verwenden.
@@ -68,9 +95,9 @@ Im `suffix`-VFS-Modus liegt ein online-only Platzhalter als
 den vorhandenen Pfad weiter. Nie Platzhalter direkt löschen, um einen Zustand zu
 ändern.
 
-Ordneroperationen wirken rekursiv über den Client. UI und CLI müssen dies vor
-einer Dehydrierung klar anzeigen. `toggle` basiert auf einem frisch gelesenen
-Zustand; bei `unknown` nicht raten.
+Ordneroperationen wirken rekursiv (Socket: über den Client; Rename: durch
+ncpin selbst). UI und CLI müssen dies vor einer Dehydrierung klar anzeigen.
+`toggle` basiert auf einem frisch gelesenen Zustand; bei `unknown` nicht raten.
 
 ## CLI-Vertrag
 

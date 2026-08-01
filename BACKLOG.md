@@ -1,12 +1,10 @@
 # ncpin — offene Arbeit
 
-0. **Nextcloud-Desktop-Client v34 (2026-07-28) hat die lokale Socket-API auf
-   macOS entfernt** (nur noch XPC mit Team-ID-Prüfung); ncpin ist damit ab
-   Client v34 funktionsunfähig, `doctor` erkennt und meldet den Fall seit
-   ncpin 1.1.0. Offen ist die Grundsatzentscheidung: Client-Downgrade auf
-   4.0.11 dokumentiert lassen, Upstream-Issue bei nextcloud/desktop stellen
-   und/oder ncpin auf ein File-Provider-Backend umbauen (setzt Umstieg des
-   Sync-Ordners auf File-Provider-VFS voraus).
+0. Beobachten, ob kommende Client-Versionen den suffix-VFS-Modus oder die
+   Rename-Mechanik in `discovery.cpp` entfernen — der Rename-Transport
+   (ncpin 1.2.0, Antwort auf die in v34 entfernte Socket-API) hängt an beidem.
+   Die Alternativen von damals (Client-Downgrade auf 4.0.11, Upstream-Issue,
+   File-Provider-Backend) sind nur dann wieder relevant.
 1. Fake-Socket-Tests noch um fragmentierte `GET_MENU_ITEMS`-Antworten, einen
    unbekannten `toggle`-Zustand und einen echten `--wait`-Timeout ergänzen.
    REGISTER-Fragmentierung, mehrere Roots, Suffixauflösung und Path-Traversal

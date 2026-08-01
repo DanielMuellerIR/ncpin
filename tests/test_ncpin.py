@@ -9,6 +9,7 @@ import io
 import json
 import os
 import socket
+import sqlite3
 import tempfile
 import threading
 import time
@@ -423,6 +424,226 @@ class PathBoundaryTests(unittest.TestCase):
             with self.assertRaises(self.ncpin.PathOutsideRoots):
                 self.ncpin.do_action(self.socket_path, outside_file, "online", [self.root])
         sender.assert_not_called()
+
+
+class RenameTransportTests(unittest.TestCase):
+    """Deterministische Tests des Rename-Transports (Client v34+).
+
+    Es gibt weder Socket noch echten Client: Config und Sync-Journal sind
+    Fixtures, die Socket-Discovery ist auf "nichts gefunden" gemockt und der
+    Client-Prozess-Check auf "laeuft". So testen wir exakt die Logik von
+    Zustand-Lesen, Umbenennen, Journal-Vorpruefung und Grenzschutz.
+    """
+
+    def setUp(self):
+        self.ncpin = load_ncpin()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.join(self.tmp.name, "Nextcloud")
+        self.outside = os.path.join(self.tmp.name, "outside")
+        os.mkdir(self.root)
+        os.mkdir(self.outside)
+        self.cfg = os.path.join(self.tmp.name, "nextcloud.cfg")
+        with open(self.cfg, "w", encoding="utf-8") as handle:
+            handle.write(
+                "[Accounts]\n"
+                "0\\FoldersWithPlaceholders\\1\\localPath=%s/\n"
+                "0\\FoldersWithPlaceholders\\1\\virtualFilesMode=suffix\n"
+                "0\\FoldersWithPlaceholders\\1\\journalPath=.sync_test.db\n"
+                % self.root)
+        self.journal = os.path.join(self.root, ".sync_test.db")
+        conn = sqlite3.connect(self.journal)
+        conn.execute("CREATE TABLE metadata "
+                     "(path TEXT PRIMARY KEY, filesize INTEGER, modtime INTEGER)")
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def journal_add(self, rel_path, filesize, modtime):
+        conn = sqlite3.connect(self.journal)
+        conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?, ?)",
+                     (rel_path, filesize, int(modtime)))
+        conn.commit()
+        conn.close()
+
+    def make_file(self, rel_path, content=b"inhalt", synced=True):
+        """Legt eine hydrierte Datei an, optional mit passendem Journal-Eintrag."""
+        full = os.path.join(self.root, rel_path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(content)
+        if synced:
+            st = os.stat(full)
+            self.journal_add(rel_path, st.st_size, int(st.st_mtime))
+        return full
+
+    def make_placeholder(self, rel_path):
+        """Legt einen dehydrierten 1-Byte-Platzhalter an."""
+        full = os.path.join(self.root, rel_path) + self.ncpin.SUFFIX
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as handle:
+            handle.write(b" ")
+        return full
+
+    def run_cli(self, *args):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(self.ncpin, "discover_socket_with_paths",
+                               return_value=(None, [])), \
+                mock.patch.object(self.ncpin, "client_process_running",
+                                  return_value=True), \
+                mock.patch.dict(os.environ, {"NCPIN_CONFIG": self.cfg,
+                                             "NCPIN_SOCKET": ""}), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = self.ncpin.main(list(args))
+        return rc, stdout.getvalue(), stderr.getvalue()
+
+    def test_status_reads_states_from_filesystem(self):
+        local_file = self.make_file("lokal.txt")
+        self.make_placeholder("online.txt")
+        logical_online = os.path.join(self.root, "online.txt")
+
+        rc, out, _err = self.run_cli("status", "--json", local_file, logical_online)
+
+        self.assertEqual(rc, 0)
+        states = {r["path"]: r["state"] for r in json.loads(out)}
+        self.assertEqual(states[os.path.realpath(local_file)], "local")
+        self.assertEqual(states[os.path.realpath(logical_online +
+                                                 self.ncpin.SUFFIX)], "online")
+
+    def test_local_renames_placeholder_for_download(self):
+        placeholder = self.make_placeholder("film.mp4")
+        logical = os.path.join(self.root, "film.mp4")
+
+        rc, _out, _err = self.run_cli("local", logical)
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(placeholder))
+        self.assertTrue(os.path.exists(logical))
+
+    def test_online_renames_synced_file(self):
+        logical = self.make_file("doku/bericht.pdf", b"voller inhalt")
+
+        rc, _out, _err = self.run_cli("online", logical)
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(logical))
+        self.assertTrue(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_online_refuses_file_missing_from_journal(self):
+        logical = self.make_file("neu.txt", synced=False)
+
+        rc, _out, _err = self.run_cli("online", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertTrue(os.path.exists(logical))
+        self.assertFalse(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_online_refuses_locally_modified_file(self):
+        logical = self.make_file("geaendert.txt", b"alter inhalt")
+        # Datei nachtraeglich veraendern: Journal passt nicht mehr.
+        with open(logical, "ab") as handle:
+            handle.write(b" plus neue bytes")
+
+        rc, out, _err = self.run_cli("online", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Dehydrierung abgelehnt", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(logical))
+
+    def test_boundary_outside_root_is_rejected_without_rename(self):
+        foreign = os.path.join(self.outside, "fremd.txt")
+        with open(foreign, "w", encoding="utf-8") as handle:
+            handle.write("nicht anfassen")
+
+        rc, _out, _err = self.run_cli("online", foreign)
+
+        self.assertEqual(rc, 3)
+        self.assertTrue(os.path.exists(foreign))
+        self.assertFalse(os.path.exists(foreign + self.ncpin.SUFFIX))
+
+    def test_symlink_escape_is_rejected_without_rename(self):
+        foreign = os.path.join(self.outside, "geheim.txt")
+        with open(foreign, "w", encoding="utf-8") as handle:
+            handle.write("privat")
+        link = os.path.join(self.root, "link.txt")
+        os.symlink(foreign, link)
+
+        rc, _out, _err = self.run_cli("online", link)
+
+        self.assertEqual(rc, 3)
+        self.assertTrue(os.path.exists(foreign))
+        self.assertFalse(os.path.exists(foreign + self.ncpin.SUFFIX))
+
+    def test_toggle_aborts_on_mixed_folder_without_renames(self):
+        local_file = self.make_file("gemischt/lokal.txt")
+        placeholder = self.make_placeholder("gemischt/online.txt")
+        folder = os.path.join(self.root, "gemischt")
+
+        rc, _out, _err = self.run_cli("toggle", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertTrue(os.path.exists(local_file))
+        self.assertTrue(os.path.exists(placeholder))
+
+    def test_folder_online_dehydrates_all_synced_files(self):
+        first = self.make_file("ordner/a.txt", b"aaaa")
+        second = self.make_file("ordner/tief/b.txt", b"bbbb")
+        folder = os.path.join(self.root, "ordner")
+
+        rc, _out, _err = self.run_cli("online", folder)
+
+        self.assertEqual(rc, 0)
+        for logical in (first, second):
+            self.assertFalse(os.path.exists(logical))
+            self.assertTrue(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_action_refused_when_client_not_running(self):
+        logical = self.make_file("ohne-client.txt")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(self.ncpin, "discover_socket_with_paths",
+                               return_value=(None, [])), \
+                mock.patch.object(self.ncpin, "client_process_running",
+                                  return_value=False), \
+                mock.patch.dict(os.environ, {"NCPIN_CONFIG": self.cfg,
+                                             "NCPIN_SOCKET": ""}), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = self.ncpin.main(["online", logical])
+
+        self.assertEqual(rc, 1)
+        self.assertTrue(os.path.exists(logical))
+
+    def test_doctor_reports_rename_transport(self):
+        rc, out, _err = self.run_cli("doctor", "--json")
+
+        self.assertEqual(rc, 0)
+        info = json.loads(out)
+        self.assertEqual(info["transport"], "rename")
+        self.assertTrue(info["backend_ok"])
+        self.assertTrue(info["client_responds"])
+        self.assertIsNone(info["socket"])
+        self.assertEqual(info["registered_folders"], [os.path.realpath(self.root)])
+
+    def test_explicit_stale_socket_never_falls_back_to_rename(self):
+        stale = os.path.join(self.tmp.name, "stale")
+        with open(stale, "w", encoding="utf-8") as handle:
+            handle.write("kein Socket")
+        logical = self.make_file("strikt.txt")
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"NCPIN_CONFIG": self.cfg,
+                                          "NCPIN_SOCKET": ""}), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            rc = self.ncpin.main(["online", logical, "--socket", stale])
+
+        self.assertEqual(rc, 1)
+        self.assertTrue(os.path.exists(logical))
+        self.assertFalse(os.path.exists(logical + self.ncpin.SUFFIX))
 
 
 if __name__ == "__main__":
