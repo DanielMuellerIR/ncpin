@@ -27,8 +27,11 @@ Aufruf (AI-Agent-/CI-freundlich):
   python3 tests/latency_bench.py --json          # maschinenlesbare Ausgabe
   python3 tests/latency_bench.py --threshold 1.0 # Gate-Schwelle (Sek Overhead)
   python3 tests/latency_bench.py --runs 7        # Wiederholungen je Szenario
-  python3 tests/latency_bench.py --roundtrip     # zusaetzlich echten Hydrate/
-                                                 #   Dehydrate-Zyklus messen (Netz!)
+  python3 tests/latency_bench.py --roundtrip --sample <pfad>
+                                                 # zusaetzlich echten Hydrate/
+                                                 #   Dehydrate-Zyklus messen (Netz!);
+                                                 #   --sample (entbehrliches
+                                                 #   Fixture) ist dafuer Pflicht
   python3 tests/latency_bench.py --sample <pfad> # eigene Beispiel-Datei
   python3 tests/latency_bench.py --python <bin> --no-clean-env  # Interpreter/Env
                                                  #   ueberschreiben (Default: 3.9.6)
@@ -68,11 +71,21 @@ SUFFIX = os.environ.get("NCPIN_SUFFIX", ".nextcloud")
 def build_runner(python_bin, clean_env):
     """Baut die Aufruf-Vorsilbe (Liste) fuer einen ncpin-Aufruf.
 
-    clean_env=True -> exakt der GUI-Pfad (env -i + System-Python).
+    clean_env=True -> exakt der GUI-Pfad (env -i + System-Python). Explizit
+    gesetzte ncpin-Fixture-Variablen (NCPIN_SOCKET/NCPIN_CONFIG/NCPIN_SUFFIX)
+    ueberleben den env -i-Schnitt: Ohne das koennte der Bench nie
+    deterministisch gegen einen Fake-Socket laufen, sondern hinge immer am
+    Zustand eines echten Clients. Sind sie nicht gesetzt, bleibt die
+    Messumgebung unveraendert der reale GUI-Pfad.
     clean_env=False -> der uebergebene Interpreter mit der aktuellen Umgebung.
     """
     if clean_env:
-        return GUI_CLEAN_ENV + [python_bin, NCPIN]
+        prefix = list(GUI_CLEAN_ENV)
+        for variable in ("NCPIN_SOCKET", "NCPIN_CONFIG", "NCPIN_SUFFIX"):
+            value = os.environ.get(variable)
+            if value:
+                prefix.append("%s=%s" % (variable, value))
+        return prefix + [python_bin, NCPIN]
     return [python_bin, NCPIN]
 
 
@@ -294,13 +307,68 @@ def read_status_state(runner, sample):
 # Roundtrip (optional, mit Netzwerk)
 # ---------------------------------------------------------------------------
 
+def _ondisk_representation(sample):
+    """Der tatsaechlich vorhandene On-Disk-Pfad des Samples (oder None).
+
+    Beim Rename-Transport unterscheidet erst der Pfadname (Suffix vorhanden
+    oder nicht) einen AUSSTEHENDEN Uebergang vom abstrakten Zustand: Ein
+    frisch fuer den Download umbenannter 1-Byte-Stub meldet weiterhin
+    "online", liegt aber schon unter dem suffixlosen Namen — der abstrakte
+    Zustand allein wuerde die Wiederherstellung faelschlich fuer erledigt
+    erklaeren, obwohl der Hydrierungswunsch weiterlaeuft.
+    """
+    return _resolve_existing(sample)
+
+
+def _revert_pending_transition(runner, sample, timeout, initial_state,
+                               initial_ondisk, result):
+    """Nimmt einen ausstehenden Rename-Uebergang transportgerecht zurueck.
+
+    Der Plan ergibt sich aus dem On-Disk-Pfad, nicht aus dem abstrakten
+    Zustand:
+      - Anfangs online-only, jetzt suffixlos: Der Downloadwunsch steht. Ein
+        1-Byte-Stub laesst sich nicht direkt zurueckdrehen (ncpin sieht dort
+        "nichts zu tun") — also erst fertig hydrieren lassen ("local"), dann
+        wieder dehydrieren ("online").
+      - Anfangs lokal, jetzt suffigiert: Die Rueck-Umbenennung ("local")
+        genuegt; der Inhalt liegt noch (oder wieder) vor.
+    Gibt True nur zurueck, wenn am Ende Zustand UND Pfad dem Anfang
+    entsprechen.
+    """
+    if initial_ondisk.endswith(SUFFIX):
+        plan = ["local", "online"]
+    else:
+        plan = ["local"]
+    for step_target in plan:
+        dt, rc, out, err = run_ncpin(
+            runner, [step_target, sample, "--wait", "--timeout", str(timeout)])
+        observed, _probe = read_status_state(runner, sample)
+        result["steps"].append({
+            "target": step_target,
+            "elapsed_ms": round(dt * 1000, 1),
+            "reached": rc == 0 and observed == step_target,
+            "rc": rc,
+            "stdout": out.strip(),
+            "stderr": err.strip(),
+            "observed_state": observed,
+            "restoration": True,
+        })
+    final_state, final_probe = read_status_state(runner, sample)
+    result["final_probe"] = final_probe
+    result["final_ondisk"] = _ondisk_representation(sample)
+    return (final_state == initial_state
+            and result["final_ondisk"] == initial_ondisk)
+
+
 def roundtrip(runner, sample, timeout):
     """Wechselt ein explizites Fixture und restauriert den gelesenen Zustand."""
     initial_state, initial_probe = read_status_state(runner, sample)
+    initial_ondisk = _ondisk_representation(sample)
     result = {
         "ok": False,
         "initial_state": initial_state,
         "initial_probe": initial_probe,
+        "initial_ondisk": initial_ondisk,
         "steps": [],
         "restore_verified": False,
     }
@@ -326,17 +394,32 @@ def roundtrip(runner, sample, timeout):
         })
     finally:
         # Nie blind die Gegenoperation ausfuehren: Zustand im finally erneut
-        # lesen. Nur ein sicher beobachteter abweichender Zustand wird aktiv auf
-        # den Anfangswert zurueckgesetzt; danach folgt eine Verifikationsabfrage.
+        # lesen. Wiederhergestellt heisst: abstrakter Zustand UND On-Disk-Pfad
+        # entsprechen dem Anfang (siehe _ondisk_representation) — sonst wird
+        # ein sicher beobachteter Uebergang aktiv zurueckgenommen und danach
+        # erneut verifiziert.
         current_state, restore_probe = read_status_state(runner, sample)
+        current_ondisk = _ondisk_representation(sample)
         result["restore_probe"] = restore_probe
-        if current_state == initial_state:
+        result["restore_ondisk"] = current_ondisk
+        path_stable = (initial_ondisk is None
+                       or current_ondisk == initial_ondisk)
+        if current_state == initial_state and path_stable:
             result["restore_verified"] = True
+        elif (initial_ondisk is not None and current_ondisk is not None
+                and current_ondisk != initial_ondisk):
+            # Der Pfadname weicht ab -> ein Rename-Uebergang steht noch aus,
+            # auch wenn der abstrakte Zustand scheinbar schon wieder passt.
+            result["restore_verified"] = _revert_pending_transition(
+                runner, sample, timeout, initial_state, initial_ondisk, result)
         elif current_state in ("local", "online"):
             dt, rc, out, err = run_ncpin(
                 runner, [initial_state, sample, "--wait", "--timeout", str(timeout)])
             final_state, final_probe = read_status_state(runner, sample)
-            restored = rc == 0 and final_state == initial_state
+            final_ondisk = _ondisk_representation(sample)
+            restored = (rc == 0 and final_state == initial_state
+                        and (initial_ondisk is None
+                             or final_ondisk == initial_ondisk))
             result["steps"].append({
                 "target": initial_state,
                 "elapsed_ms": round(dt * 1000, 1),
@@ -348,6 +431,7 @@ def roundtrip(runner, sample, timeout):
                 "restoration": True,
             })
             result["final_probe"] = final_probe
+            result["final_ondisk"] = final_ondisk
             result["restore_verified"] = restored
         else:
             result["error"] = "Zustand nach Roundtrip unbekannt; Restore nicht blind ausgefuehrt."

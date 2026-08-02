@@ -7,12 +7,15 @@ import importlib.util
 import json
 import math
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
 BENCH_PATH = os.path.join(REPO, "tests", "latency_bench.py")
 
 
@@ -185,6 +188,167 @@ class RoundtripTests(unittest.TestCase):
         self.assertTrue(result["restore_verified"])
         commands = [call.args[1][0] for call in run.call_args_list]
         self.assertEqual(commands, ["status", "online", "status", "status", "local", "status"])
+
+
+class RenameTransportRoundtripTests(unittest.TestCase):
+    """Roundtrip-Restore gegen simulierte Rename-Transport-Zustaende.
+
+    run_ncpin ist gemockt; die Seiteneffekte auf echten Temp-Dateien bilden
+    das Verhalten des Rename-Transports nach: Die Umbenennung passiert sofort,
+    den Inhalt liefert bzw. entfernt erst spaeter der Client. Kein echter
+    Server, kein echter Client.
+    """
+
+    def setUp(self):
+        self.bench = load_bench()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.logical = os.path.join(self.tmp.name, "fixture.bin")
+        self.placeholder = self.logical + self.bench.SUFFIX
+        self.verbs = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def fs_status_result(self):
+        """Abstrakter Zustand wie ihn ncpin vom Dateisystem lesen wuerde."""
+        if os.path.lexists(self.placeholder):
+            size = os.stat(self.placeholder).st_size
+            state = "online" if size == 1 else "unknown"
+        elif os.path.lexists(self.logical):
+            state = "online" if os.stat(self.logical).st_size == 1 else "local"
+        else:
+            state = "unknown"
+        return status_result(state)
+
+    def make_fake_run(self, op_effects):
+        """Baut ein run_ncpin-Double.
+
+        op_effects ist die erwartete Abfolge der MUTIERENDEN Aufrufe als Liste
+        von (verb, seiteneffekt, rc); status-Aufrufe lesen den echten
+        Temp-Dateizustand.
+        """
+        def fake_run(runner, args):
+            verb = args[0]
+            self.verbs.append(verb)
+            if verb == "status":
+                return self.fs_status_result()
+            self.assertTrue(op_effects,
+                            "unerwarteter Mutationsaufruf: %s" % verb)
+            expected_verb, effect, rc = op_effects.pop(0)
+            self.assertEqual(verb, expected_verb)
+            effect()
+            return (0.2, rc, "", "" if rc == 0 else "Timeout")
+        return fake_run
+
+    def test_pending_download_stub_is_reverted_not_false_verified(self):
+        # Wait-Timeout nach dem Download-Rename: Der 1-Byte-Stub liegt schon
+        # suffixlos, meldet aber weiter "online". Der abstrakte Zustand passt
+        # damit scheinbar zum Anfang — die Wiederherstellung muss den Pfad
+        # pruefen und den ausstehenden Download erst abschliessen lassen,
+        # dann wieder dehydrieren.
+        with open(self.placeholder, "wb") as handle:
+            handle.write(b" ")
+
+        def start_download():
+            os.rename(self.placeholder, self.logical)  # Stub bleibt 1 Byte
+
+        def finish_download():
+            with open(self.logical, "wb") as handle:
+                handle.write(b"voller inhalt")
+
+        def dehydrate():
+            os.rename(self.logical, self.placeholder)
+            with open(self.placeholder, "wb") as handle:
+                handle.write(b" ")
+
+        effects = [("local", start_download, 1),
+                   ("local", finish_download, 0),
+                   ("online", dehydrate, 0)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 5.0)
+
+        self.assertFalse(result["ok"])  # der Hin-Uebergang selbst schlug fehl
+        self.assertTrue(result["restore_verified"])
+        self.assertEqual(effects, [])   # alle Wiederherstellungsschritte liefen
+        self.assertTrue(os.path.exists(self.placeholder))
+        self.assertFalse(os.path.exists(self.logical))
+        self.assertEqual(self.verbs,
+                         ["status", "local", "status", "status",
+                          "local", "status", "online", "status", "status"])
+
+    def test_pending_dehydration_rename_is_rolled_back_despite_unknown_state(self):
+        # Wait-Timeout nach dem Dehydrierungs-Rename: Die Suffixdatei traegt
+        # noch den vollen Inhalt und meldet "unknown". Frueher wurde die
+        # Wiederherstellung dann komplett uebersprungen; jetzt wird die
+        # Umbenennung anhand des Pfads zurueckgenommen.
+        with open(self.logical, "wb") as handle:
+            handle.write(b"voller inhalt")
+
+        def dehydrate_rename_only():
+            os.rename(self.logical, self.placeholder)  # Inhalt bleibt voll
+
+        def undo_rename():
+            os.rename(self.placeholder, self.logical)
+
+        effects = [("online", dehydrate_rename_only, 1),
+                   ("local", undo_rename, 0)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 5.0)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restore_verified"])
+        self.assertEqual(effects, [])
+        self.assertFalse(os.path.exists(self.placeholder))
+        with open(self.logical, "rb") as handle:
+            self.assertEqual(handle.read(), b"voller inhalt")
+        self.assertEqual(self.verbs,
+                         ["status", "online", "status", "status",
+                          "local", "status", "status"])
+
+
+class FixtureSocketIntegrationTests(unittest.TestCase):
+    """Ende-zu-Ende: Bench-Subprozess mit /usr/bin/python3, env -i und
+    Fixture-Socket — deckt Prozessstart, Handshake und Burst-Reader ohne
+    echten Client ab (NCPIN_SOCKET ueberlebt den env -i-Schnitt).
+    """
+
+    def test_bench_runs_deterministically_against_fixture_socket(self):
+        sys.path.insert(0, HERE)
+        try:
+            from test_ncpin import FakeNextcloudSocket
+        finally:
+            sys.path.remove(HERE)
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = os.path.join(tmp.name, "Nextcloud")
+        os.mkdir(root)
+        sample = os.path.join(root, "beispiel.txt")
+        with open(sample, "w", encoding="utf-8") as handle:
+            handle.write("inhalt")
+        socket_path = os.path.join(tmp.name, "nc.sock")
+        server = FakeNextcloudSocket(socket_path, [root]).start()
+        self.addCleanup(server.close)
+
+        env = {"PATH": "/usr/bin:/bin", "HOME": tmp.name,
+               "NCPIN_SOCKET": socket_path}
+        # Grosszuegige Schwelle: Hier zaehlt die deterministische Korrektheit
+        # des Ende-zu-Ende-Pfads, nicht die enge Latenzgrenze des echten Gates.
+        proc = subprocess.run(
+            ["/usr/bin/python3", BENCH_PATH, "--json", "--runs", "1",
+             "--threshold", "3.0", "--sample", sample],
+            env=env, capture_output=True, text=True)
+
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        report = json.loads(proc.stdout)
+        self.assertTrue(report["gate_pass"])
+        self.assertTrue(report["correctness_ok"])
+        self.assertIn("NCPIN_SOCKET=", report["interpreter"])
+        measurements = {m["name"]: m for m in report["measurements"]}
+        self.assertEqual(measurements["status-file"]["state"], "local")
+        self.assertGreaterEqual(measurements["list-folder"]["entries"], 1)
 
 
 if __name__ == "__main__":
