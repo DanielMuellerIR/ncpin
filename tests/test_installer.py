@@ -6,12 +6,14 @@ Alle Zielpfade liegen in einem temporaeren HOME. Die Tests verwenden niemals
 /Applications, den Schluesselbund oder ein echtes Notary-Profil.
 """
 
+import importlib.util
 import os
 import plistlib
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -247,6 +249,53 @@ class InstallerTest(unittest.TestCase):
         result = self.run_installer(env=self.release_env(fakebin))
         self.assertEqual(result.returncode, 73, result.stderr + result.stdout)
         self.assert_old_app_preserved()
+
+    def test_stage_only_and_uninstall_are_mutually_exclusive(self):
+        # "Nur bauen" darf niemals nebenbei deinstallieren: die Kombination
+        # ist ein Aufruffehler (Exit 2), BEVOR irgendein Ziel angefasst wird.
+        self.install_ok()
+        stage = os.path.join(self.root, "stage")
+
+        for arguments in (["--stage-only", stage, "--uninstall"],
+                          ["--uninstall", "--stage-only", stage]):
+            with self.subTest(arguments=arguments):
+                result = self.run_installer(*arguments)
+                self.assertEqual(result.returncode, 2,
+                                 result.stderr + result.stdout)
+                self.assertIn("schliessen sich aus", result.stderr)
+                # Installierte Artefakte blieben unangetastet.
+                self.assertTrue(os.path.isdir(self.app()))
+                self.assertTrue(os.path.isdir(self.workflow()))
+                self.assertTrue(os.path.lexists(
+                    os.path.join(self.links, "ncpin")))
+
+    def test_atomic_replace_missing_target_branch_refuses_late_collision(self):
+        # Simuliert das Rennen im "Ziel existiert noch nicht"-Zweig: Die
+        # Existenzpruefung sieht kein Ziel, aber beim Rename ist ein fremdes
+        # aufgetaucht. Der exklusive Rename muss es schuetzen (EEXIST) statt
+        # es still zu ersetzen.
+        spec = importlib.util.spec_from_file_location(
+            "atomic_replace_test_module",
+            os.path.join(self.copy, "tools", "atomic_replace.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        parent = os.path.join(self.root, "atomic-excl")
+        os.makedirs(parent)
+        source = os.path.join(parent, "quelle")
+        destination = os.path.join(parent, "ziel")
+        for path, content in ((source, "neu"), (destination, "fremd")):
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+
+        with mock.patch.object(module.os.path, "lexists",
+                               side_effect=lambda p: p == source):
+            with self.assertRaises(OSError):
+                module.atomic_replace(source, destination)
+
+        with open(destination, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "fremd")
+        self.assertTrue(os.path.exists(source))
 
     def test_atomic_replace_swaps_without_intermediate_missing_target(self):
         parent = os.path.join(self.root, "atomic")

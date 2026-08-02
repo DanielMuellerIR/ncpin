@@ -36,6 +36,7 @@ Aufruf: ./install.sh [--force] [--uninstall] [--stage-only <dir>] [--help]
   --stage-only <dir> Droplets und Quick Actions nur bauen (signiert und, wenn
                      moeglich, notarisiert) und nach <dir> legen — nichts
                      installieren. Unterbau von build.sh und release.sh.
+                     Nicht mit --uninstall kombinierbar.
 EOF
 }
 
@@ -54,6 +55,14 @@ while [ $# -gt 0 ]; do
 	esac
 	shift
 done
+
+# Betriebsarten schliessen sich aus: "nur bauen" darf niemals nebenbei eine
+# Installation entfernen. Vor jedem Zielzugriff mit Aufruffehler ablehnen.
+if [ "$UNINSTALL" -eq 1 ] && [ "$STAGE_ONLY" -eq 1 ]; then
+	print -u2 -- "--uninstall und --stage-only schliessen sich aus."
+	usage >&2
+	exit 2
+fi
 
 path_exists() {
 	[ -e "$1" ] || [ -L "$1" ]

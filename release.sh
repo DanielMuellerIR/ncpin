@@ -76,10 +76,17 @@ DIST="build/dmg"
 DMG="$DIST/ncpin.dmg"
 RW_DMG="$DIST/ncpin-rw.dmg"
 MOUNT_DIR="/Volumes/$VOLNAME"
+# Geraeteknoten (/dev/diskN[sM]) des EIGENEN hdiutil attach. Nur dieses Geraet
+# wird je getrennt — niemals blind der Mountpoint: Dort koennte ein fremdes
+# Volume gleichen Namens haengen, das ein detach -force mitten im Schreiben
+# zwangsweise auswerfen wuerde.
+ATTACHED_DEV=""
 
 cleanup() {
-	if hdiutil info | grep -Fq "$MOUNT_DIR"; then
-		hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
+	if [ -n "$ATTACHED_DEV" ]; then
+		hdiutil detach "$ATTACHED_DEV" >/dev/null 2>&1 \
+			|| hdiutil detach "$ATTACHED_DEV" -force >/dev/null 2>&1 || true
+		ATTACHED_DEV=""
 	fi
 	rm -f -- "$RW_DMG"
 }
@@ -96,7 +103,15 @@ done
 echo "=== 2/3 DMG packen ==="
 mkdir -p -- "$DIST"
 rm -f -- "$DMG" "$RW_DMG"
-[ -d "$MOUNT_DIR" ] && hdiutil detach "$MOUNT_DIR" -force >/dev/null 2>&1 || true
+# Fail-closed statt detach -force: Haengt unter dem Mountpoint bereits ein
+# (moeglicherweise fremdes) Volume, wird es NICHT zwangsgetrennt — abbrechen
+# und dem Nutzer das Auswerfen ueberlassen. mount(8) zeigt aufgeloeste Pfade,
+# darum beide Schreibweisen pruefen.
+if mount | grep -qF " on $MOUNT_DIR (" \
+		|| mount | grep -qF " on ${MOUNT_DIR:A} ("; then
+	print -u2 -- "FEHLER: $MOUNT_DIR ist bereits eingehaengt — bitte zuerst auswerfen."
+	exit 2
+fi
 
 # Nur die Apps ins Image — die .workflow-Dateien gehören nach ~/Library/Services
 # und wären hier eine Einladung, sie an die falsche Stelle zu ziehen.
@@ -121,7 +136,18 @@ EOF
 SIZE=$(( $(du -sm "$PAYLOAD" | cut -f1) + 20 ))
 hdiutil create -srcfolder "$PAYLOAD" -volname "$VOLNAME" -fs HFS+ \
 	-fsargs "-c c=64,a=16,e=16" -format UDRW -size "${SIZE}m" "$RW_DMG"
-hdiutil attach "$RW_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -noverify -noautoopen
+# Attach-Ausgabe einfangen und daraus den Geraeteknoten der Zeile mit unserem
+# Mountpoint ziehen — alle spaeteren detach-Aufrufe treffen nur dieses Geraet.
+# hdiutil meldet den symlink-aufgeloesten Mountpoint (real belegt: /var/... in
+# der Ausgabe als /private/var/...), darum gegen beide Schreibweisen matchen.
+ATTACH_OUT="$(hdiutil attach "$RW_DMG" -mountpoint "$MOUNT_DIR" -nobrowse -noverify -noautoopen)"
+print -r -- "$ATTACH_OUT"
+ATTACHED_DEV="$(print -r -- "$ATTACH_OUT" \
+	| awk -v m="$MOUNT_DIR" -v r="${MOUNT_DIR:A}" '$NF == m || $NF == r {print $1; exit}')"
+if [ -z "$ATTACHED_DEV" ]; then
+	print -u2 -- "FEHLER: Geraeteknoten des eigenen Attach nicht ermittelbar."
+	exit 1
+fi
 
 ln -s /Applications "$MOUNT_DIR/Applications"
 
@@ -156,7 +182,10 @@ else
 fi
 
 sync; sleep 2                       # Race: DS_Store-Schreibpuffer vs. detach
-hdiutil detach "$MOUNT_DIR" -force
+# Erst regulaer trennen; -force nur als zweiter Versuch und ausschliesslich
+# auf den eigenen, oben ermittelten Geraeteknoten.
+hdiutil detach "$ATTACHED_DEV" || { sleep 2; hdiutil detach "$ATTACHED_DEV" -force; }
+ATTACHED_DEV=""
 
 hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG"
 rm -f -- "$RW_DMG"
