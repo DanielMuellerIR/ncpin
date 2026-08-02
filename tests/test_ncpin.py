@@ -211,6 +211,66 @@ class SocketDiscoveryTests(unittest.TestCase):
 
         self.assertEqual(discovered, fragmented.socket_path)
 
+    def test_handshake_reset_falls_back_to_next_candidate(self):
+        # Ein Reset NACH erfolgreichem Connect (ConnectionResetError im ersten
+        # recv) darf die Discovery nicht crashen, sondern muss zum naechsten
+        # Kandidaten weitergehen.
+        first = self.server("a-reset.sock")
+        active = self.server("b-active.sock")
+        real_recv = self.ncpin._recv_burst
+        calls = {"count": 0}
+
+        def flaky_recv(sock, first_wait, sentinel=None):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ConnectionResetError(54, "Connection reset by peer")
+            return real_recv(sock, first_wait, sentinel)
+
+        with mock.patch.object(self.ncpin, "_recv_burst",
+                               side_effect=flaky_recv):
+            discovered = self.discover_with(
+                [first.socket_path, active.socket_path])
+
+        self.assertEqual(discovered, active.socket_path)
+
+    def test_explicit_socket_handshake_reset_reports_no_socket(self):
+        # Beim explizit gesetzten Socket gibt es keinen Fallback: Der Reset
+        # endet als "kein Socket" (und damit spaeter als sauberer Exit 1).
+        active = self.server("active.sock")
+
+        with mock.patch.object(
+                self.ncpin, "_recv_burst",
+                side_effect=ConnectionResetError(54, "reset")):
+            discovered = self.discover_with(
+                [active.socket_path], override=active.socket_path)
+
+        self.assertIsNone(discovered)
+
+
+class ParseStateTests(unittest.TestCase):
+    """Zustandsparser: unvollstaendige Bursts duerfen keinen Zustand liefern."""
+
+    def setUp(self):
+        self.ncpin = load_ncpin()
+
+    def test_missing_command_line_yields_unknown(self):
+        # Ein abgebrochener Burst mit nur EINER der beiden Command-IDs ist
+        # keine Zustandsaussage — sonst koennte toggle aufgrund einer halben
+        # Antwort eine zustandsaendernde Gegenaktion senden.
+        only_online = "MENU_ITEM:MAKE_ONLINE_ONLY::Online\n"
+        only_avail = "MENU_ITEM:MAKE_AVAILABLE_LOCALLY:d:Lokal\n"
+        self.assertEqual(self.ncpin.parse_state(only_online), "unknown")
+        self.assertEqual(self.ncpin.parse_state(only_avail), "unknown")
+        self.assertEqual(self.ncpin.parse_state(""), "unknown")
+
+    def test_complete_bursts_still_resolve_both_states(self):
+        local_burst = ("MENU_ITEM:MAKE_AVAILABLE_LOCALLY:d:Lokal\n"
+                       "MENU_ITEM:MAKE_ONLINE_ONLY::Online\n")
+        online_burst = ("MENU_ITEM:MAKE_AVAILABLE_LOCALLY::Lokal\n"
+                        "MENU_ITEM:MAKE_ONLINE_ONLY:d:Online\n")
+        self.assertEqual(self.ncpin.parse_state(local_burst), "local")
+        self.assertEqual(self.ncpin.parse_state(online_burst), "online")
+
 
 class CliParserTests(unittest.TestCase):
     def setUp(self):
@@ -627,6 +687,170 @@ class RenameTransportTests(unittest.TestCase):
         self.assertTrue(info["client_responds"])
         self.assertIsNone(info["socket"])
         self.assertEqual(info["registered_folders"], [os.path.realpath(self.root)])
+
+    def test_status_reports_empty_placeholder_as_unknown(self):
+        # Der Vertrag verlangt EXAKT 1 Byte: eine leere Suffixdatei ist kein
+        # gueltiger Platzhalter und darf nicht als "online" durchgehen.
+        empty = os.path.join(self.root, "leer.txt") + self.ncpin.SUFFIX
+        with open(empty, "wb"):
+            pass
+
+        rc, out, _err = self.run_cli("status", "--json", empty)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out)[0]["state"], "unknown")
+
+    def test_online_with_full_content_placeholder_is_an_error(self):
+        # Platzhalter mit Vollinhalt = vom Client ignorierter Dehydrierungs-
+        # wunsch. "online" darauf darf nicht mit Exit 0 Erfolg vortaeuschen.
+        stale = os.path.join(self.root, "haengt.txt") + self.ncpin.SUFFIX
+        with open(stale, "wb") as handle:
+            handle.write(b"voller inhalt")
+
+        rc, out, _err = self.run_cli(
+            "online", "--json", os.path.join(self.root, "haengt.txt"))
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Zustand unklar", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(stale))
+
+    def test_folder_state_exact_ignores_scan_cap_and_unknown_children(self):
+        # Stichprobe (exact=False) darf am Deckel abbrechen; die
+        # Entscheidungsvariante (exact=True) muss den ganzen Baum sehen und
+        # "unknown"-Kinder weiterreichen.
+        self.make_file("kaputt/echt.txt")
+        broken = os.path.join(self.root, "kaputt",
+                              "muell.txt") + self.ncpin.SUFFIX
+        with open(broken, "wb") as handle:
+            handle.write(b"vollinhalt")
+        folder = os.path.join(self.root, "kaputt")
+
+        self.assertEqual(self.ncpin.fs_folder_state(folder), "local")
+        self.assertEqual(self.ncpin.fs_folder_state(folder, exact=True),
+                         "unknown")
+
+    def test_toggle_folder_ignores_scan_cap_and_aborts_on_mixed_tree(self):
+        # Mit Deckel 1 sieht die Stichprobe nur eine Datei; toggle muss den
+        # gemischten Baum trotzdem vollstaendig erkennen und abbrechen.
+        local_file = self.make_file("gross/a-lokal.txt")
+        placeholder = self.make_placeholder("gross/z-online.txt")
+        folder = os.path.join(self.root, "gross")
+
+        with mock.patch.object(self.ncpin, "FOLDER_SCAN_CAP", 1):
+            rc, _out, _err = self.run_cli("toggle", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertTrue(os.path.exists(local_file))
+        self.assertTrue(os.path.exists(placeholder))
+
+    def test_wait_folder_requires_full_tree_not_sample(self):
+        # --wait darf Erfolg nicht aus einer gedeckelten Stichprobe ableiten:
+        # hinter dem Deckel liegt noch ein Platzhalter -> Ziel "local" ist
+        # NICHT erreicht.
+        self.make_file("warte/a.txt")
+        self.make_placeholder("warte/z.txt")
+        folder = os.path.join(self.root, "warte")
+
+        with mock.patch.object(self.ncpin, "FOLDER_SCAN_CAP", 1):
+            reached = self.ncpin.rename_wait_for_state(
+                folder, "local", 0.6, [self.root])
+
+        self.assertFalse(reached)
+
+    def test_traversal_is_anchored_against_directory_symlink_swap(self):
+        # Simuliert das TOCTOU-Fenster der frueheren os.walk-Traversierung:
+        # os.path.islink meldet (wie nach einem Austausch KURZ NACH der
+        # Pruefung) faelschlich "kein Symlink". Die an Verzeichnis-fds
+        # verankerte Traversierung (O_NOFOLLOW) darf dem Symlink trotzdem
+        # nicht folgen und nichts ausserhalb der Syncwurzel umbenennen.
+        outside_placeholder = os.path.join(
+            self.outside, "geheim.txt") + self.ncpin.SUFFIX
+        with open(outside_placeholder, "wb") as handle:
+            handle.write(b" ")
+        folder = os.path.join(self.root, "ordner")
+        os.makedirs(folder)
+        inside_placeholder = self.make_placeholder("ordner/drin.txt")
+        os.symlink(self.outside, os.path.join(folder, "evil"))
+
+        with mock.patch.object(self.ncpin.os.path, "islink",
+                               return_value=False):
+            rc, _out, _err = self.run_cli("local", folder)
+
+        self.assertEqual(rc, 0)
+        # Innerhalb der Wurzel wurde gearbeitet, ausserhalb nicht.
+        self.assertFalse(os.path.exists(inside_placeholder))
+        self.assertTrue(os.path.exists(outside_placeholder))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.outside, "geheim.txt")))
+
+    def test_exclusive_rename_refuses_when_target_appears(self):
+        # Der exklusive Rename (renameatx_np + RENAME_EXCL) darf ein parallel
+        # entstandenes Ziel nie still ueberschreiben.
+        folder = os.path.join(self.root, "excl")
+        os.makedirs(folder)
+        for name in ("quelle.txt", "ziel.txt"):
+            with open(os.path.join(folder, name), "wb") as handle:
+                handle.write(name.encode("utf-8"))
+        dirfd = os.open(folder, self.ncpin._O_DIR_NOFOLLOW)
+        try:
+            with self.assertRaises(RuntimeError):
+                self.ncpin._rename_excl_at(dirfd, "quelle.txt", "ziel.txt")
+            with open(os.path.join(folder, "ziel.txt"), "rb") as handle:
+                self.assertEqual(handle.read(), b"ziel.txt")
+            os.unlink(os.path.join(folder, "ziel.txt"))
+            self.ncpin._rename_excl_at(dirfd, "quelle.txt", "ziel.txt")
+        finally:
+            os.close(dirfd)
+        self.assertTrue(os.path.exists(os.path.join(folder, "ziel.txt")))
+        self.assertFalse(os.path.exists(os.path.join(folder, "quelle.txt")))
+
+    def write_config_without_journal_path(self):
+        with open(self.cfg, "w", encoding="utf-8") as handle:
+            handle.write(
+                "[Accounts]\n"
+                "0\\FoldersWithPlaceholders\\1\\localPath=%s/\n"
+                "0\\FoldersWithPlaceholders\\1\\virtualFilesMode=suffix\n"
+                % self.root)
+
+    def test_dehydration_refuses_ambiguous_journal_fallback(self):
+        # Ohne konfigurierten Journalpfad und mit ZWEI .sync_*.db-Kandidaten
+        # darf nicht blind der erste gewaehlt werden.
+        logical = self.make_file("mehrdeutig.txt", b"inhalt")
+        self.write_config_without_journal_path()
+        second = os.path.join(self.root, ".sync_zweit.db")
+        conn = sqlite3.connect(second)
+        conn.execute("CREATE TABLE metadata "
+                     "(path TEXT PRIMARY KEY, filesize INTEGER, modtime INTEGER)")
+        conn.commit()
+        conn.close()
+
+        rc, out, _err = self.run_cli("online", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("mehrere Sync-Journale", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(logical))
+
+    def test_dehydration_uses_unique_journal_fallback_without_config(self):
+        # Genau EIN Journal im Ordner bleibt als eindeutiger Fallback erlaubt.
+        logical = self.make_file("eindeutig.txt", b"inhalt")
+        self.write_config_without_journal_path()
+
+        rc, _out, _err = self.run_cli("online", logical)
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_path_error_exit_code_survives_later_runtime_error(self):
+        # README: Exit 3 gilt fuer "ein/mehrere Pfade" — ein spaeterer
+        # Laufzeitfehler (Exit 1) eines anderen Pfads darf das nicht
+        # herabstufen.
+        missing = os.path.join(self.root, "fehlt.txt")
+        unsynced = self.make_file("ungesynct.txt", synced=False)
+
+        rc, out, _err = self.run_cli("online", "--json", missing, unsynced)
+
+        self.assertEqual(rc, 3)
+        self.assertEqual(len(json.loads(out)), 2)
 
     def test_explicit_stale_socket_never_falls_back_to_rename(self):
         stale = os.path.join(self.tmp.name, "stale")

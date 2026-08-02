@@ -250,6 +250,12 @@ def read_registered_paths(sock_path):
                 registered = line[len("REGISTER_PATH:"):]
                 if registered:
                     paths.append(registered)
+    except OSError:
+        # Verbindungsreset o.ae. mitten im Handshake: Kandidat wie einen toten
+        # Socket behandeln (leere Liste). Die Discovery prueft dann den
+        # naechsten Kandidaten; ein expliziter Socket endet kontrolliert mit
+        # "kein Transport" statt mit einem Traceback.
+        return []
     finally:
         s.close()
     return paths
@@ -308,7 +314,14 @@ def parse_state(menu_text):
       Format je Zeile: MENU_ITEM:<befehl>:<flags>:<titel>
       - MAKE_AVAILABLE_LOCALLY aktiv  -> Datei ist gerade online-only  -> "online"
       - MAKE_ONLINE_ONLY aktiv        -> Datei ist gerade lokal         -> "local"
+
+    "Zeile fehlt" ist dabei NICHT dasselbe wie "vorhanden, aber disabled":
+    Ein abgebrochener Burst kann eine der beiden Menuezeilen verlieren. Nur
+    wenn beide Command-IDs gesehen wurden, ist die Antwort vollstaendig genug
+    fuer eine Zustandsaussage — sonst ehrlich "unknown" (toggle bricht dann ab,
+    statt aufgrund einer halben Antwort eine Gegenaktion zu senden).
     """
+    avail_seen = online_seen = False
     avail_enabled = online_enabled = False
     for line in menu_text.splitlines():
         if not line.startswith("MENU_ITEM:"):
@@ -320,9 +333,13 @@ def parse_state(menu_text):
         cmd, flags = parts[1], parts[2]
         enabled = "d" not in flags  # 'd' => disabled
         if cmd == "MAKE_AVAILABLE_LOCALLY":
+            avail_seen = True
             avail_enabled = enabled
         elif cmd == "MAKE_ONLINE_ONLY":
+            online_seen = True
             online_enabled = enabled
+    if not (avail_seen and online_seen):
+        return "unknown"
     if online_enabled and not avail_enabled:
         return "local"
     if avail_enabled and not online_enabled:
@@ -518,20 +535,27 @@ def fs_file_state(ondisk):
     except OSError:
         return "unknown"
     if ondisk.endswith(SUFFIX):
-        # Platzhalter mit Vollinhalt (>1 Byte) wäre ein ignorierter
-        # Dehydrierungswunsch oder Datenmüll -> ehrlich "unknown".
-        return "online" if size <= PLACEHOLDER_SIZE else "unknown"
+        # Der Vertrag verlangt EXAKT 1 Byte. Ein Platzhalter mit Vollinhalt
+        # (>1 Byte) wäre ein ignorierter Dehydrierungswunsch, eine leere Datei
+        # (0 Byte) Datenmüll -> beides ehrlich "unknown".
+        return "online" if size == PLACEHOLDER_SIZE else "unknown"
     return "online" if size == PLACEHOLDER_SIZE else "local"
 
 
-def fs_folder_state(folder):
+def fs_folder_state(folder, exact=False):
     """Aggregierter Zustand eines Ordners (rekursiv, mit frühem Ausstieg).
 
     - nur lokale Dateien gesehen  -> "local"
     - nur Platzhalter gesehen     -> "online"
     - Mischung oder leer          -> "unknown" (wie das Socket-Menü früher)
-    Der Stichproben-Deckel FOLDER_SCAN_CAP hält den Aufruf auch bei riesigen
-    Bäumen schnell; ein Ordner-Zustand ist ohnehin nur ein Aggregat.
+
+    exact=False (Anzeige-Stichprobe): Der Deckel FOLDER_SCAN_CAP hält den
+    Aufruf auch bei riesigen Bäumen schnell, und einzelne "unknown"-Dateien
+    werden übergangen — reicht für eine unverbindliche Statuszeile.
+    exact=True (Entscheidungsgrundlage für toggle und --wait): vollständige
+    Traversierung ohne Deckel, und jede "unknown"-Datei macht den ganzen
+    Ordner "unknown" — eine Stichprobe könnte sonst einen gemischten Baum
+    als einheitlich melden und toggle in die falsche Richtung schicken.
     """
     seen_local = seen_online = False
     scanned = 0
@@ -545,23 +569,31 @@ def fs_folder_state(folder):
                 seen_local = True
             elif state == "online":
                 seen_online = True
+            elif exact:
+                # z.B. Platzhalter mit falscher Größe: Zustand unklar.
+                return "unknown"
             if seen_local and seen_online:
                 return "unknown"
-            scanned += 1
-            if scanned >= FOLDER_SCAN_CAP:
-                break
-        if scanned >= FOLDER_SCAN_CAP:
+            if not exact:
+                scanned += 1
+                if scanned >= FOLDER_SCAN_CAP:
+                    break
+        if not exact and scanned >= FOLDER_SCAN_CAP:
             break
     if seen_local != seen_online:
         return "local" if seen_local else "online"
     return "unknown"
 
 
-def rename_query_state(ondisk, roots):
-    """Pendant zu query_state() für den Rename-Transport (rein lesend)."""
+def rename_query_state(ondisk, roots, exact=False):
+    """Pendant zu query_state() für den Rename-Transport (rein lesend).
+
+    exact=True erzwingt bei Ordnern die vollständige Traversierung (siehe
+    fs_folder_state) — Pflicht für toggle und --wait.
+    """
     ondisk = checked_path(ondisk, roots)
     if os.path.isdir(ondisk):
-        return fs_folder_state(ondisk)
+        return fs_folder_state(ondisk, exact=exact)
     return fs_file_state(ondisk)
 
 
@@ -579,12 +611,22 @@ def _suffix_folder_for(path, rename_ctx):
 
 
 def _journal_file_for(folder):
-    """Pfad des Sync-Journals eines Ordners (aus der Config oder per Glob)."""
+    """Pfad des Sync-Journals eines Ordners (aus der Config oder per Glob).
+
+    Ohne konfigurierten (und vorhandenen) Journalpfad ist nur GENAU EIN
+    ``.sync_*.db``-Treffer akzeptabel. Bei mehreren Kandidaten würde eine
+    blinde Wahl die Dehydrierungsfreigabe gegen ein fremdes oder veraltetes
+    Journal prüfen — dann lieber geschlossen ablehnen.
+    """
     if folder["journal"]:
         candidate = os.path.join(folder["path"], folder["journal"])
         if os.path.exists(candidate):
             return candidate
     hits = sorted(glob.glob(os.path.join(folder["path"], ".sync_*.db")))
+    if len(hits) > 1:
+        raise RuntimeError(
+            "mehrere Sync-Journale in %s gefunden — Dehydrierung abgelehnt"
+            % folder["path"])
     return hits[0] if hits else None
 
 
@@ -660,63 +702,176 @@ def _journal_entry_for(logical, rename_ctx):
     return None
 
 
-def _require_synced(logical, rename_ctx):
+def _require_synced(logical, rename_ctx, st=None):
     """Wirft RuntimeError, wenn die Datei nicht fertig gesynct ist.
 
     Die Engine akzeptiert den Dehydrierungs-Rename nur, wenn mtime und Größe
     exakt zum Journal passen (discovery.cpp) — sonst ignoriert sie ihn still.
     Diese Vorprüfung macht daraus einen ehrlichen Fehler statt eines No-ops.
+    ``st`` erlaubt dem Aufrufer, ein bereits (per dir_fd) gelesenes
+    Stat-Ergebnis wiederzuverwenden.
     """
     entry = _journal_entry_for(logical, rename_ctx)
     if entry is None:
         raise RuntimeError(
             "nicht im Sync-Journal (noch nicht hochgeladen?) — Dehydrierung abgelehnt")
     filesize, modtime = entry
-    st = os.stat(logical)
+    if st is None:
+        st = os.stat(logical)
     if st.st_size != filesize or int(st.st_mtime) != int(modtime):
         raise RuntimeError(
             "lokale Änderung noch nicht gesynct — Dehydrierung abgelehnt")
 
 
-def _rename_pin_file(ondisk, target, rename_ctx):
-    """Setzt den Pin-Wunsch für genau eine Datei per Umbenennung um."""
-    logical = ondisk[:-len(SUFFIX)] if ondisk.endswith(SUFFIX) else ondisk
-    placeholder = logical + SUFFIX
-    logical_exists = os.path.lexists(logical)
-    placeholder_exists = os.path.lexists(placeholder)
+# Verzeichnisse während der Rekursion sicher öffnen: O_NOFOLLOW macht Prüfung
+# und Öffnen zu EINEM Systemaufruf — ein Verzeichnis, das zwischenzeitlich durch
+# einen Symlink ersetzt wurde, lässt sich damit gar nicht erst öffnen (kein
+# Zeitfenster zwischen islink-Check und Zugriff).
+_O_DIR_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_DIRECTORY", 0)
+
+# macOS-Flag für renameatx_np: Rename schlägt mit EEXIST fehl, statt ein
+# vorhandenes Ziel still zu ersetzen (POSIX-rename würde es überschreiben).
+_RENAME_EXCL = 0x00000004
+_LIBC = None
+
+
+def _libc():
+    """Lädt die C-Bibliothek einmalig (für renameatx_np); lazy wie subprocess."""
+    global _LIBC
+    if _LIBC is None:
+        import ctypes
+        lib = ctypes.CDLL(None, use_errno=True)
+        lib.renameatx_np.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                                     ctypes.c_int, ctypes.c_char_p,
+                                     ctypes.c_uint]
+        lib.renameatx_np.restype = ctypes.c_int
+        _LIBC = lib
+    return _LIBC
+
+
+def _rename_excl_at(dirfd, source_name, target_name):
+    """Benennt innerhalb eines geöffneten Verzeichnisses exklusiv um.
+
+    renameatx_np(RENAME_EXCL) bricht mit EEXIST ab, wenn das Ziel inzwischen
+    existiert — ein parallel (z.B. vom Client) erzeugter Gegenpfad wird also
+    nie still überschrieben, sondern als kontrollierter Fehler gemeldet.
+    """
+    import ctypes
+    import errno
+    rc = _libc().renameatx_np(dirfd, os.fsencode(source_name),
+                              dirfd, os.fsencode(target_name), _RENAME_EXCL)
+    if rc != 0:
+        err = ctypes.get_errno()
+        if err == errno.EEXIST:
+            raise RuntimeError(
+                "Zielname %s existiert inzwischen — Rename abgebrochen"
+                % target_name)
+        raise OSError(err, os.strerror(err), target_name)
+
+
+def _lexists_at(dirfd, name):
+    """os.path.lexists relativ zu einem geöffneten Verzeichnis."""
+    try:
+        os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+
+
+def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
+    """Setzt den Pin-Wunsch für genau eine Datei per Umbenennung um.
+
+    Alle Dateisystemzugriffe laufen relativ zum geöffneten Verzeichnis-fd
+    (openat-Semantik): Auch wenn der Pfad danach durch Symlinks ausgetauscht
+    wird, wirken Prüfungen und Renames weiter im ursprünglichen, an der
+    Syncwurzel verifizierten Verzeichnis. ``dirpath`` dient nur dem
+    Journalabgleich und den Fehlertexten.
+    """
+    logical_name = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else name
+    placeholder_name = logical_name + SUFFIX
+    logical = os.path.join(dirpath, logical_name)
+    logical_exists = _lexists_at(dirfd, logical_name)
+    placeholder_exists = _lexists_at(dirfd, placeholder_name)
     if logical_exists and placeholder_exists:
         raise RuntimeError(
             "logischer Name und Platzhalter existieren beide — nicht eindeutig")
     if target == "local":
         if logical_exists:
             return  # schon lokal (oder Download läuft bereits)
-        os.rename(placeholder, logical)
+        _rename_excl_at(dirfd, placeholder_name, logical_name)
         return
     # target == "online"
     if not logical_exists:
-        return  # schon online-only
-    if os.path.islink(logical) or not os.path.isfile(logical):
+        # Schon online-only — aber nur, wenn der Platzhalter wirklich ein
+        # gültiger 1-Byte-Platzhalter ist. Ein Platzhalter mit anderer Größe
+        # (Vollinhalt = vom Client ignorierter Dehydrierungswunsch, 0 Byte =
+        # Datenmüll) wäre KEIN erledigter Pin-Wunsch -> ehrlicher Fehler.
+        if placeholder_exists:
+            pst = os.stat(placeholder_name, dir_fd=dirfd, follow_symlinks=False)
+            if pst.st_size != PLACEHOLDER_SIZE:
+                raise RuntimeError(
+                    "Platzhalter %s hat %d statt %d Byte — Zustand unklar"
+                    % (placeholder_name, pst.st_size, PLACEHOLDER_SIZE))
+        return
+    st = os.stat(logical_name, dir_fd=dirfd, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):
+        # Symlinks und Sonderdateien haben keinen dehydrierbaren Inhalt.
         raise RuntimeError("kein regulärer Dateiinhalt — Dehydrierung abgelehnt")
-    if os.stat(logical).st_size == PLACEHOLDER_SIZE:
+    if st.st_size == PLACEHOLDER_SIZE:
         # Sieht aus wie ein noch nicht hydrierter 1-Byte-Stub: nichts zu tun.
         return
-    _require_synced(logical, rename_ctx)
-    os.rename(logical, placeholder)
+    _require_synced(logical, rename_ctx, st=st)
+    _rename_excl_at(dirfd, logical_name, placeholder_name)
 
 
-def _iter_folder_files(folder):
-    """Alle sichtbaren regulären Dateien eines Ordners (rekursiv, ohne Symlinks)."""
-    for dirpath, dirnames, filenames in os.walk(folder):
-        dirnames[:] = [d for d in dirnames
-                       if not d.startswith(".")
-                       and not os.path.islink(os.path.join(dirpath, d))]
-        for name in filenames:
-            if name.startswith("."):
+def _rename_pin_file(ondisk, target, rename_ctx):
+    """Pin-Wunsch für eine einzelne Datei, verankert am Elternverzeichnis."""
+    parent = os.path.dirname(ondisk)
+    dirfd = os.open(parent, _O_DIR_NOFOLLOW)
+    try:
+        _rename_pin_at(dirfd, parent, os.path.basename(ondisk), target,
+                       rename_ctx)
+    finally:
+        os.close(dirfd)
+
+
+def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, skipped, counted):
+    """Rekursive Ordner-Abarbeitung über Verzeichnis-fds (openat-Semantik).
+
+    Sichtbare reguläre Dateien werden umbenannt; versteckte Einträge und
+    Symlinks fliegen raus. Unterverzeichnisse werden mit O_NOFOLLOW relativ
+    zum Eltern-fd geöffnet: Ein während des Laufs durch einen Symlink
+    ersetztes Verzeichnis lässt sich so nicht öffnen, die Traversierung kann
+    die geprüfte Syncwurzel also nicht verlassen (frühere os.walk-Variante:
+    Symlink-Check und Abstieg waren getrennte Schritte mit Zeitfenster).
+    """
+    for entry in sorted(os.scandir(dirfd), key=lambda e: e.name):
+        name = entry.name
+        if name.startswith("."):
+            continue
+        try:
+            if entry.is_symlink():
                 continue
-            full = os.path.join(dirpath, name)
-            if os.path.islink(full):
-                continue
-            yield full
+            if entry.is_dir(follow_symlinks=False):
+                try:
+                    subfd = os.open(name, _O_DIR_NOFOLLOW, dir_fd=dirfd)
+                except OSError:
+                    # gerade gelöscht oder durch Symlink ersetzt -> auslassen
+                    continue
+                try:
+                    _rename_pin_tree(subfd, os.path.join(dirpath, name),
+                                     target, rename_ctx, skipped, counted)
+                finally:
+                    os.close(subfd)
+            elif entry.is_file(follow_symlinks=False):
+                counted[0] += 1
+                try:
+                    _rename_pin_at(dirfd, dirpath, name, target, rename_ctx)
+                except RuntimeError as exc:
+                    skipped.append(str(exc))
+        except OSError:
+            # Eintrag zwischen scandir und Zugriff verschwunden -> auslassen.
+            continue
 
 
 def rename_do_action(ondisk, target, rename_ctx, roots):
@@ -732,30 +887,37 @@ def rename_do_action(ondisk, target, rename_ctx, roots):
             "Nextcloud-Client läuft nicht — Pin-Wunsch würde erst beim "
             "nächsten Start verarbeitet")
     if os.path.isdir(ondisk):
-        total = 0
         skipped = []
-        for full in _iter_folder_files(ondisk):
-            total += 1
-            try:
-                _rename_pin_file(full, target, rename_ctx)
-            except RuntimeError as exc:
-                skipped.append(str(exc))
+        counted = [0]
+        # Wurzel des Teilbaums mit O_NOFOLLOW öffnen: Ab hier arbeitet die
+        # Rekursion nur noch relativ zu geöffneten Verzeichnissen weiter.
+        dirfd = os.open(ondisk, _O_DIR_NOFOLLOW)
+        try:
+            _rename_pin_tree(dirfd, ondisk, target, rename_ctx, skipped,
+                             counted)
+        finally:
+            os.close(dirfd)
         if skipped:
             raise RuntimeError("%d von %d Datei(en) übersprungen — z.B.: %s"
-                               % (len(skipped), total, skipped[0]))
+                               % (len(skipped), counted[0], skipped[0]))
         return
     _rename_pin_file(ondisk, target, rename_ctx)
 
 
 def rename_wait_for_state(orig_path, target, timeout, roots):
-    """Pendant zu wait_for_state(): pollt den Dateisystem-Zustand."""
+    """Pendant zu wait_for_state(): pollt den Dateisystem-Zustand.
+
+    exact=True: --wait darf Erfolg nur nach vollständiger Traversierung
+    melden — eine Stichprobe könnte fertige Dateien am Anfang sehen und
+    unfertige hinter dem Deckel übersehen.
+    """
     start = time.time()
     while time.time() - start < timeout:
         ondisk = resolve_ondisk(orig_path)
         if ondisk is None:
             time.sleep(0.5)
             continue
-        if rename_query_state(ondisk, roots) == target:
+        if rename_query_state(ondisk, roots, exact=True) == target:
             return True
         time.sleep(0.5)
     return False
@@ -767,6 +929,21 @@ def rename_wait_for_state(orig_path, target, timeout, roots):
 
 class PathOutsideRoots(ValueError):
     """Ein aufgeloester Pfad liegt ausserhalb aller registrierten Syncwurzeln."""
+
+
+def merge_exit_code(current, new):
+    """Zentrale Exit-Code-Prioritaet bei mehreren Pfad-Argumenten.
+
+    Die READMEs definieren Exit 3 fuer "ein/mehrere Pfade nicht gefunden oder
+    ausserhalb". Ein bereits erkannter Pfadfehler (3) darf deshalb nicht durch
+    einen spaeteren Laufzeitfehler (1) eines anderen Pfads ueberschrieben
+    werden — sonst hinge der Exit-Code von der Argument-Reihenfolge ab.
+    Prioritaet: 3 (Pfadfehler) > 1 (Laufzeitfehler) > 0 (ok).
+    """
+    priority = {0: 0, 1: 1, 3: 2}
+    if priority.get(new, 0) > priority.get(current, 0):
+        return new
+    return current
 
 
 def canonical_path(path):
@@ -978,7 +1155,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.2.0")
+    ap.add_argument("--version", action="version", version="ncpin 1.2.1")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)
@@ -1136,14 +1313,14 @@ def main(argv):
         if not in_any_folder(raw, roots):
             results.append({"path": raw, "op": args.command,
                             "error": "nicht in einem Nextcloud-Ordner"})
-            exit_code = 3
+            exit_code = merge_exit_code(exit_code, 3)
             continue
 
         ondisk = resolve_ondisk(raw)
         if ondisk is None:
             results.append({"path": raw, "op": args.command,
                             "error": "Datei nicht gefunden"})
-            exit_code = 3
+            exit_code = merge_exit_code(exit_code, 3)
             continue
 
         try:
@@ -1151,7 +1328,7 @@ def main(argv):
         except PathOutsideRoots as e:
             results.append({"path": raw, "op": args.command,
                             "error": str(e)})
-            exit_code = 3
+            exit_code = merge_exit_code(exit_code, 3)
             continue
 
         try:
@@ -1172,13 +1349,15 @@ def main(argv):
                 if transport == "socket":
                     cur = query_state(sock, ondisk, roots)
                 else:
-                    cur = rename_query_state(ondisk, roots)
+                    # exact: fuer die Richtungsentscheidung zaehlt der ganze
+                    # Baum, nicht die schnelle Anzeige-Stichprobe.
+                    cur = rename_query_state(ondisk, roots, exact=True)
                 if cur == "unknown":
                     # Zustand nicht ermittelbar (z.B. Client im Fehlerzustand) —
                     # lieber Fehler melden als blind hydrieren oder dehydrieren.
                     results.append({"path": ondisk, "op": args.command,
                                      "error": "Zustand nicht ermittelbar (toggle abgebrochen)"})
-                    exit_code = 1
+                    exit_code = merge_exit_code(exit_code, 1)
                     continue
                 target = "online" if cur == "local" else "local"
 
@@ -1196,26 +1375,26 @@ def main(argv):
                 rec["waited"] = True
                 rec["reached"] = reached
                 if not reached:
-                    exit_code = 1
+                    exit_code = merge_exit_code(exit_code, 1)
             results.append(rec)
         except PathOutsideRoots as e:
             # Der Pfad kann sich zwischen Aufloesung und Transportoperation
             # aendern (z.B. ausgetauschter Symlink). Auch dann Exit 3, keine Aktion.
             results.append({"path": ondisk, "op": args.command,
                             "error": str(e)})
-            exit_code = 3
+            exit_code = merge_exit_code(exit_code, 3)
         except RuntimeError as e:
             # Rename-Transport lehnt ab (nicht gesynct, Client fehlt, Journal
             # unlesbar): ehrlicher Laufzeitfehler je Pfad, weiter geht's.
             results.append({"path": ondisk, "op": args.command,
                             "error": str(e)})
-            exit_code = 1
+            exit_code = merge_exit_code(exit_code, 1)
         except OSError as e:
             # Verbindungs-/Dateisystemfehler waehrend der Verarbeitung: sauberen
             # Fehlereintrag anhaengen und naechsten Pfad verarbeiten statt crashen.
             results.append({"path": ondisk, "op": args.command,
                              "error": "Transportfehler: %s" % e})
-            exit_code = 1
+            exit_code = merge_exit_code(exit_code, 1)
 
     emit(results, args.json, args.quiet)
     return exit_code
