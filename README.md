@@ -53,7 +53,7 @@ cd ~/git/ncpin
 The installer is idempotent and per Mac:
 
 1. links the `ncpin` CLI into a PATH directory,
-2. builds two apps into `/Applications` (`Lokal halten` = keep local, `Speicher freigeben` = free up space),
+2. builds two apps into `/Applications` (`Lokal halten` = keep local, `Speicher freigeben` = free up space) — that target requires a notarized build, see below,
 3. installs two Finder **Quick Actions** (right-click → Quick Actions).
 
 Apps and workflows are fully built and verified in a temporary directory before they are installed
@@ -67,8 +67,16 @@ exact ncpin symlink.
 If a **Developer ID** certificate is present in your keychain, `install.sh` automatically signs the
 two apps (Developer ID + hardened runtime), **notarizes and staples** them, and then checks them with
 Gatekeeper. Any signing, notary, staple, or Gatekeeper failure aborts installation and preserves the
-previously installed version. Without a certificate it falls back to local ad-hoc signing — the
-apps still work locally (on first launch you may need to right-click → Open once).
+previously installed version. Without a certificate it falls back to local ad-hoc signing — such a
+build works locally (on first launch you may need to right-click → Open once), but it is **never**
+installed into `/Applications`: that folder holds bundles with a stapled notarization ticket only.
+The installer stops with exit code 2 before it builds anything, and the same applies to
+`NCPIN_NOTARIZE=0`. Choose one of these instead:
+
+```sh
+./build.sh                            # apps stay in the project folder build/
+NCPIN_APPS_DIR=<dir> ./install.sh     # explicitly chosen target, e.g. ~/Applications
+```
 
 There are two more entry points, neither of which installs anything:
 

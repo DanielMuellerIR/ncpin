@@ -105,6 +105,40 @@ class InstallerTest(unittest.TestCase):
     def assert_old_app_preserved(self):
         self.assertTrue(os.path.exists(os.path.join(self.app(), "sentinel")))
 
+    def patched_installer(self):
+        """Kopie von install.sh, deren geschuetztes Ziel das Testverzeichnis ist.
+
+        Die Regel "nur notarisierte Bundles" haengt an der Konstanten
+        /Applications. Ein Test darf dort niemals hinschreiben, auch nicht
+        versehentlich bei kaputtem Gate. Deshalb wird genau dieses eine
+        case-Muster auf das temporaere Zielverzeichnis umgebogen; der gepruefte
+        Code drumherum bleibt der echte. Schlaegt die Ersetzung fehl, faellt der
+        Test auf — der Gate-Code kann also nicht unbemerkt verschwinden.
+        """
+        original = os.path.join(self.copy, "install.sh")
+        with open(original, encoding="utf-8") as handle:
+            text = handle.read()
+        needle = "\t\t/Applications|/Applications/*) return 0 ;;\n"
+        self.assertIn(needle, text)
+        protected = os.path.realpath(self.apps)
+        patched = text.replace(
+            needle, "\t\t%s|%s/*) return 0 ;;\n" % (protected, protected))
+        target = os.path.join(self.copy, "install-testziel.sh")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(patched)
+        os.chmod(target, 0o755)
+        return target
+
+    def run_patched_installer(self, env):
+        return subprocess.run(
+            ["/bin/zsh", self.patched_installer()],
+            cwd=self.copy,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
     def test_install_builds_owned_signed_artifacts_with_bundle_relative_cli(self):
         self.install_ok()
 
@@ -303,6 +337,72 @@ class InstallerTest(unittest.TestCase):
         result = self.run_installer(env=self.release_env(fakebin))
         self.assertEqual(result.returncode, 73, result.stderr + result.stdout)
         self.assert_old_app_preserved()
+
+    def test_protected_target_refuses_adhoc_build_before_building(self):
+        # Ohne Developer-ID darf nichts ins geschuetzte Ziel — und zwar bevor
+        # ueberhaupt gebaut wird. Der vorher installierte Stand bleibt liegen.
+        self.install_ok()
+        open(os.path.join(self.app(), "sentinel"), "w").close()
+
+        result = self.run_patched_installer(self.env)
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertIn("Kein Developer-ID-Zertifikat", result.stderr)
+        self.assertIn("ausdruecklich gewaehltes anderes Ziel", result.stderr)
+        self.assert_old_app_preserved()
+
+    def test_protected_target_refuses_signed_but_unnotarized_build(self):
+        # NCPIN_NOTARIZE=0 ist eine bewusste Entscheidung gegen das Ticket —
+        # damit ist das geschuetzte Ziel ebenfalls gesperrt.
+        self.install_ok()
+        open(os.path.join(self.app(), "sentinel"), "w").close()
+        env = self.env.copy()
+        env["NCPIN_SIGN_ID"] = "Developer ID Application: Test"
+        env["NCPIN_NOTARIZE"] = "0"
+
+        result = self.run_patched_installer(env)
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertIn("NCPIN_NOTARIZE=0", result.stderr)
+        self.assert_old_app_preserved()
+
+    def test_protected_target_refuses_bundle_without_stapled_ticket(self):
+        # Zweite Schranke: Die Absicht stimmt (Zertifikat da, Notarisierung
+        # gewollt), aber am fertigen Bundle haengt kein Ticket. Auch dann wird
+        # nicht installiert.
+        self.install_ok()
+        open(os.path.join(self.app(), "sentinel"), "w").close()
+        fakebin = os.path.join(self.root, "fake-staple")
+        self.fake_command(fakebin, "codesign", 0)
+        self.fake_command(fakebin, "spctl", 0)
+        counter = os.path.join(self.root, "staple-calls")
+        wrapper = os.path.join(fakebin, "xcrun")
+        with open(wrapper, "w", encoding="utf-8") as handle:
+            # Die beiden Pruefungen innerhalb der Notarisierung sollen gelingen;
+            # erst die Schranke unmittelbar vor der Installation (dritter Aufruf)
+            # findet kein angeheftetes Ticket.
+            handle.write(
+                "#!/bin/sh\n"
+                'if [ "$1" = "stapler" ] && [ "$2" = "validate" ]; then\n'
+                '  calls=$(cat "%s" 2>/dev/null || echo 0)\n'
+                '  calls=$((calls + 1))\n'
+                '  echo "$calls" > "%s"\n'
+                '  [ "$calls" -le 2 ] || exit 1\n'
+                "fi\n"
+                "exit 0\n" % (counter, counter))
+        os.chmod(wrapper, 0o755)
+
+        result = self.run_patched_installer(self.release_env(fakebin))
+
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("kein angeheftetes Notary-Ticket", result.stderr)
+        self.assert_old_app_preserved()
+
+    def test_unprotected_target_still_accepts_adhoc_build(self):
+        # Gegenprobe: Ausserhalb des geschuetzten Ziels bleibt der Ad-hoc-Build
+        # die normale Arbeitsweise — die Regel sperrt nur /Applications.
+        self.install_ok()
+        self.assertTrue(os.path.isdir(self.app()))
 
     def test_stage_only_and_uninstall_are_mutually_exclusive(self):
         # "Nur bauen" darf niemals nebenbei deinstallieren: die Kombination

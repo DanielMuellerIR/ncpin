@@ -210,6 +210,13 @@ und Zeitstempel, notarisiert und stapelt. Identität und Notary-Profil sind
 Umgebungs-/Keychainkonfiguration, keine Repo-Konstanten. Fehlt die Identität,
 darf lokal ad hoc gebaut werden, aber dieser Stand ist kein öffentliches Release.
 
+`/Applications` ist ausschließlich Bundles mit angeheftetem Notary-Ticket
+vorbehalten. Die Regel ist fail-closed verdrahtet, nicht bloß dokumentiert: Ohne
+Developer-ID oder mit `NCPIN_NOTARIZE=0` bricht `install.sh` mit Exit 2 ab, bevor
+überhaupt gebaut wird; fehlt am fertigen Bundle das Ticket, bricht es unmittelbar
+vor dem Einsetzen mit Exit 1 ab. Ad-hoc-Stände bleiben im Projektordner
+(`./build.sh`) oder gehen in ein ausdrücklich gesetztes `NCPIN_APPS_DIR`.
+
 Prüfungen für einen Release:
 
 - `codesign --verify --strict --deep` für beide Apps;
@@ -252,7 +259,7 @@ vor einer neuen Codeänderung reproduzieren; ein Neustart kann Systemzustand
 <!-- context-eval: ncpin-system-python | CLI besteht im Shell-Python | Erwartung: zusätzlich minimale Umgebung mit /usr/bin/python3 -->
 <!-- context-eval: ncpin-fire-forget | MAKE wurde gesendet | Erwartung: nicht als Zustandserfolg melden; bei --wait pollen -->
 <!-- context-eval: ncpin-roundtrip | Latenz-Roundtrip gewünscht | Erwartung: entbehrliches Fixture, Ausgangszustand sichern/wiederherstellen -->
-<!-- context-eval: ncpin-release | ad-hoc Apps gebaut | Erwartung: nicht als notarisierten Release ausgeben -->
+<!-- context-eval: ncpin-release | ad-hoc Apps gebaut | Erwartung: nicht als notarisierten Release ausgeben und nicht nach /Applications installieren -->
 
 Die frühere Release- und Regelchronik liegt in der internen Projekthistorie
 und ist keine aktive Anweisung.

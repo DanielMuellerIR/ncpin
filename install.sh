@@ -10,7 +10,9 @@ set -euo pipefail
 REPO="${0:A:h}"
 NCPIN="$REPO/ncpin"
 # Ziel ist seit 2026-07-26 /Applications statt ~/Applications: ein Ort für alle
-# eigenen Apps, und dort liegen ausschließlich Bundles mit Notary-Ticket.
+# eigenen Apps, und dort liegen ausschließlich Bundles mit Notary-Ticket. Das ist
+# keine bloße Zusage: Ohne angeheftetes Ticket bricht der Installer ab, statt dort
+# einen Ad-hoc-Build abzulegen (siehe target_needs_notary_ticket).
 # ~/Applications wurde dabei geräumt — wer es dennoch braucht, setzt NCPIN_APPS_DIR.
 APPS="${NCPIN_APPS_DIR:-/Applications}"
 SVC="${NCPIN_SERVICES_DIR:-$HOME/Library/Services}"
@@ -170,17 +172,6 @@ assert_replaceable_link() {
 	exit 1
 }
 
-# Kollisionen vor dem teuren Build erkennen. Bis hier wurde kein Ziel veraendert.
-# Bei --stage-only entfaellt das: Dieser Weg fasst kein Installationsziel an, und
-# ein fremdes ~/Applications/Lokal halten.app duerfte den Build nicht blockieren.
-if [ "$STAGE_ONLY" -eq 0 ]; then
-	assert_replaceable_tree "$APP1" "$BUNDLE_BASE.local"
-	assert_replaceable_tree "$APP2" "$BUNDLE_BASE.online"
-	assert_replaceable_tree "$QA1" "$QA_BASE.local"
-	assert_replaceable_tree "$QA2" "$QA_BASE.online"
-	assert_replaceable_link "$LINK"
-fi
-
 # Explizit gesetztes leeres NCPIN_SIGN_ID bedeutet lokaler Ad-hoc-Fallback und
 # verhindert auch in Tests jeden Keychain-Zugriff. Nur wenn die Variable fehlt,
 # wird automatisch nach einer Developer ID gesucht.
@@ -203,6 +194,48 @@ fi
 : "${NOTARY_PROFILE:=ncpin-notary}"
 NOTARIZE="${NCPIN_NOTARIZE:-1}"
 case "$NOTARIZE" in 0|1) ;; *) print -u2 -- "NCPIN_NOTARIZE muss 0 oder 1 sein"; exit 2 ;; esac
+
+# In /Applications liegen ausschliesslich Bundles mit angeheftetem
+# Notary-Ticket. Ein ad-hoc oder nur signierter Build darf dort nie landen —
+# lieber gar nicht installieren als unnotarisiert.
+target_needs_notary_ticket() {
+	# :A macht den Pfad absolut und loest Symlinks auf, damit weder ein
+	# relatives NCPIN_APPS_DIR noch ein Umweg ueber einen Symlink die Regel
+	# umgeht.
+	case "${APPS:A}" in
+		/Applications|/Applications/*) return 0 ;;
+	esac
+	return 1
+}
+
+# Fail-closed und bewusst VOR der Kollisionspruefung: Wer ohne Zertifikat nach
+# /Applications installieren will, soll genau das erklaert bekommen und nicht
+# zuerst eine Kollisionsmeldung sehen. Bis hier wurde kein Ziel angefasst.
+if [ "$STAGE_ONLY" -eq 0 ] && target_needs_notary_ticket; then
+	if [ -z "$SIGN_ID" ] || [ "$NOTARIZE" != "1" ]; then
+		if [ -z "$SIGN_ID" ]; then
+			print -u2 -- "FEHLER: Kein Developer-ID-Zertifikat — ein ad-hoc signiertes Bundle darf nicht nach $APPS."
+		else
+			print -u2 -- "FEHLER: NCPIN_NOTARIZE=0 — ein unnotarisiertes Bundle darf nicht nach $APPS."
+		fi
+		print -u2 -- "Dort liegen ausschliesslich Bundles mit angeheftetem Notary-Ticket."
+		print -u2 -- "Stattdessen:"
+		print -u2 -- "  ./build.sh                          # nur bauen, Apps bleiben im Projektordner build/"
+		print -u2 -- "  NCPIN_APPS_DIR=<ziel> ./install.sh  # ausdruecklich gewaehltes anderes Ziel"
+		exit 2
+	fi
+fi
+
+# Kollisionen vor dem teuren Build erkennen. Bis hier wurde kein Ziel veraendert.
+# Bei --stage-only entfaellt das: Dieser Weg fasst kein Installationsziel an, und
+# ein fremdes ~/Applications/Lokal halten.app duerfte den Build nicht blockieren.
+if [ "$STAGE_ONLY" -eq 0 ]; then
+	assert_replaceable_tree "$APP1" "$BUNDLE_BASE.local"
+	assert_replaceable_tree "$APP2" "$BUNDLE_BASE.online"
+	assert_replaceable_tree "$QA1" "$QA_BASE.local"
+	assert_replaceable_tree "$QA2" "$QA_BASE.online"
+	assert_replaceable_link "$LINK"
+fi
 
 BUILD="$(mktemp -d "${TMPDIR:-/tmp}/ncpin-install.XXXXXX")"
 trap 'rm -rf -- "$BUILD"' EXIT
@@ -312,6 +345,20 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
 	done
 	echo "BUILD OK: $STAGE_DIR (nicht installiert)"
 	exit 0
+fi
+
+# Zweite, harte Schranke unmittelbar vor dem Einsetzen. Der Vorabcheck oben
+# prueft die Absicht (Zertifikat da, Notarisierung gewollt), diese Stelle das
+# Ergebnis: Ohne angeheftetes Ticket am fertigen Bundle wird nach /Applications
+# nichts installiert.
+if target_needs_notary_ticket; then
+	for artefakt in "$BUILT_APP1" "$BUILT_APP2"; do
+		if ! xcrun stapler validate "$artefakt" >/dev/null 2>&1; then
+			print -u2 -- "FEHLER: kein angeheftetes Notary-Ticket: ${artefakt:t}"
+			print -u2 -- "Installation nach $APPS abgebrochen; nichts veraendert."
+			exit 1
+		fi
+	done
 fi
 
 mkdir -p "$APPS" "$SVC" "$LINKDIR"
