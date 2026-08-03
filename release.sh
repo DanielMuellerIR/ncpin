@@ -127,7 +127,8 @@ Die beiden Apps hier einfach nach /Programme (Applications) ziehen.
 
 Nicht enthalten:
   - die Quick Actions fürs Finder-Rechtsklick-Menü
-  - der CLI-Befehl `ncpin`
+  - der CLI-Befehl `ncpin` für Terminal und Skripte
+    (die Apps selbst bringen die CLI im Bundle mit und laufen ohne sie)
 
 Beides installiert nur ./install.sh aus dem Repository — ein Image kann den
 Ordner ~/Library/Services nicht befüllen.

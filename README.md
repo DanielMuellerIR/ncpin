@@ -80,6 +80,12 @@ There are two more entry points, neither of which installs anything:
 
 > The DMG carries the two apps only. The Finder right-click Quick Actions and the CLI symlink come from `./install.sh` alone — a disk image cannot populate `~/Library/Services`. A README inside the image says so too.
 
+Each app carries its own copy of the `ncpin` CLI inside the bundle
+(`Contents/Resources/ncpin`) and resolves it through a bundle-relative path at runtime. No absolute
+path of the build machine ends up in a droplet, so the apps keep working after being dragged out of
+the DMG onto another Mac or moved somewhere else. A rebuilt CLI reaches an installed app only
+through another `./install.sh` run.
+
 - Auto-detected; controlled via `NCPIN_SIGN_ID`, `NOTARY_PROFILE` or the older `NCPIN_NOTARY_PROFILE` (an
   `xcrun notarytool store-credentials` profile), and `NCPIN_NOTARIZE=0` (intentionally sign only,
   e.g. offline).

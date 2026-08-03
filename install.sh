@@ -219,7 +219,7 @@ build_app() {  # $1=action $2=label $3=app-pfad $4=bundle-id
 	local action="$1" label="$2" app="$3" bundle_id="$4"
 	local source="$BUILD/$action.applescript" app_exec icns
 	/usr/bin/python3 "$REPO/apps/render_applescript.py" \
-		"$TMPL" "$action" "$label" "$NCPIN" "$source"
+		"$TMPL" "$action" "$label" "$source"
 	/usr/bin/osacompile -o "$app" "$source"
 	/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $bundle_id" \
 		"$app/Contents/Info.plist" 2>/dev/null \
@@ -242,6 +242,15 @@ build_app() {  # $1=action $2=label $3=app-pfad $4=bundle-id
 	mv "$app/Contents/MacOS/droplet" "$app/Contents/MacOS/$app_exec"
 	/usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $app_exec" \
 		"$app/Contents/Info.plist"
+
+	# Die CLI wandert als Kopie MIT ins Bundle. Das Droplet loest sie zur Laufzeit
+	# ueber das eigene Bundle auf (siehe ncpinPath in der AppleScript-Vorlage), es
+	# steht also kein absoluter Pfad dieses Macs in der App. Nur so ist ein aus dem
+	# DMG gezogenes Droplet auf einem fremden Mac ueberhaupt funktionsfaehig.
+	# Zwingend VOR dem Signieren: Signieren bleibt der letzte inhaltsaendernde
+	# Schritt, sonst zerbricht die Bundle-Versiegelung.
+	/usr/bin/ditto "$NCPIN" "$app/Contents/Resources/ncpin"
+	chmod 0755 "$app/Contents/Resources/ncpin"
 
 	if [ -n "$SIGN_ID" ]; then
 		codesign --force --options runtime --timestamp \

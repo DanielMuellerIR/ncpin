@@ -3,7 +3,7 @@
 -- Diese Vorlage wird von install.sh zu zwei Apps gebaut:
 --   "Lokal halten"      (@@ACTION@@ = local)
 --   "Speicher freigeben"(@@ACTION@@ = online)
--- @@ACTION@@/@@LABEL@@/@@NCPIN_PATH@@ werden beim Bauen ersetzt.
+-- Aktion und Beschriftung setzt install.sh beim Bauen in die Vorlage ein.
 --
 -- Zwei Bedienarten:
 --   1. Droplet: Datei(en)/Ordner aus dem Finder auf die App ziehen.
@@ -16,11 +16,21 @@
 --
 property ncAction : "@@ACTION@@"   -- "local" oder "online"
 property ncLabel : "@@LABEL@@"     -- Anzeigetext für Meldungen
-property ncpinExecutable : @@NCPIN_PATH@@
 
--- Absoluter Pfad zur ncpin-CLI, vom Installer sicher in die Vorlage eingesetzt.
+-- Pfad zur ncpin-CLI. Die CLI liegt IM eigenen App-Bundle unter
+-- Contents/Resources/ncpin (install.sh legt sie beim Bauen dort ab). Der Pfad
+-- wird erst zur Laufzeit aus dem eigenen Bundle abgeleitet — im Droplet steht
+-- also kein absoluter Pfad des Build-Macs. Deshalb funktioniert die App auch,
+-- wenn sie aus einem DMG auf einen fremden Mac gezogen oder spaeter verschoben
+-- wird.
 on ncpinPath()
-	return ncpinExecutable
+	set bundlePath to POSIX path of (path to me)
+	-- "POSIX path of" haengt an ein Bundle einen Schraegstrich an; ohne dieses
+	-- Abschneiden entstuende ein doppelter Schraegstrich im Aufruf.
+	if bundlePath ends with "/" then
+		set bundlePath to text 1 thru -2 of bundlePath
+	end if
+	return bundlePath & "/Contents/Resources/ncpin"
 end ncpinPath
 
 -- ncpin mit einer Liste von POSIX-Pfaden aufrufen.
@@ -36,7 +46,9 @@ on runNcpin(posixPaths)
 	-- ncpin normalisiert Optionen fuer Apples System-Python 3.9 und akzeptiert
 	-- --wait vor, zwischen oder nach den Pfaden. Die Position am Ende bleibt fuer
 	-- alte lokale Installationen kompatibel.
-	set cmd to quoted form of ncpin & " " & ncAction & argline & " --wait"
+	-- Ausdruecklich mit dem System-Python starten: Die CLI im Bundle muss dafuer
+	-- weder ein Ausfuehrbit noch ein passendes "python3" im PATH haben.
+	set cmd to "/usr/bin/python3 " & quoted form of ncpin & " " & ncAction & argline & " --wait"
 	try
 		set out to do shell script cmd
 		display notification ((count of posixPaths) as text) & " Objekt(e): " & ncLabel with title "Nextcloud"
@@ -150,7 +162,7 @@ on pickFromFrontWindow()
 	set ncpin to my ncpinPath()
 	set rawList to ""
 	try
-		set rawList to do shell script quoted form of ncpin & " list " & quoted form of folderPath
+		set rawList to do shell script "/usr/bin/python3 " & quoted form of ncpin & " list " & quoted form of folderPath
 	on error errMsg number errNum
 		-- errMsg enthaelt die Original-Fehlermeldung von ncpin (z.B. "Ordner nicht gefunden"
 		-- oder "nicht in einem Nextcloud-Ordner"), daher direkt anzeigen statt pauschale Meldung.

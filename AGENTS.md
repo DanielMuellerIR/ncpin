@@ -120,8 +120,17 @@ einführen, die nur im Homebrew-Python existiert.
 
 ## Apps und Finder
 
-`install.sh` baut zwei Apps mit stabilen Bundle-IDs. `on open` verarbeitet
-gedroppte Pfade ohne Finder-AppleEvents und ist der robusteste GUI-Pfad.
+`install.sh` baut zwei Apps mit stabilen Bundle-IDs. Beide tragen eine Kopie der
+CLI in `Contents/Resources/ncpin`; das AppleScript löst sie über `path to me`
+bundle-relativ auf und startet sie mit `/usr/bin/python3`. In einer
+ausgelieferten App darf nie ein absoluter Pfad des Build-Macs stehen — sonst ist
+ein aus dem DMG gezogenes Droplet auf einem fremden Mac funktionslos. Die Kopie
+muss vor dem Signieren im Bundle liegen, sonst ist sie nicht versiegelt. Folge:
+Eine installierte App folgt nicht automatisch dem Repo-Stand der CLI; eine
+geänderte CLI erreicht sie erst mit dem nächsten `install.sh`-Lauf.
+
+`on open` verarbeitet gedroppte Pfade ohne Finder-AppleEvents und ist der
+robusteste GUI-Pfad.
 `on run` verwendet bei vorhandener Finder-Auswahl diese; sonst fragt es genau
 einmal den Ordner des vordersten Finderfensters ab und zeigt die Ausgabe von
 `ncpin list` als Mehrfachauswahl.

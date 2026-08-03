@@ -82,6 +82,12 @@ Daneben gibt es zwei weitere Einstiegspunkte, die **nichts** installieren:
 
 > Das DMG enthält nur die beiden Apps. Die Quick Actions fürs Finder-Rechtsklick-Menü und der CLI-Befehl kommen ausschließlich über `./install.sh` — ein Image kann `~/Library/Services` nicht befüllen. Ein LIESMICH im Image sagt das auch dem, der es öffnet.
 
+Jede App trägt eine eigene Kopie der CLI `ncpin` im Bundle
+(`Contents/Resources/ncpin`) und löst sie zur Laufzeit bundle-relativ auf. In einem Droplet steht
+damit kein absoluter Pfad des Build-Macs; die Apps funktionieren auch, wenn man sie aus dem DMG auf
+einen anderen Mac zieht oder später verschiebt. Eine neu gebaute CLI erreicht eine installierte App
+nur über einen erneuten `./install.sh`-Lauf.
+
 - Auto-erkannt; per Env steuerbar: `NCPIN_SIGN_ID`, `NOTARY_PROFILE` bzw. das ältere `NCPIN_NOTARY_PROFILE` (ein
   `xcrun notarytool store-credentials`-Profil), `NCPIN_NOTARIZE=0` (bewusst nur signieren, z.B.
   offline). Ein explizit leeres `NCPIN_SIGN_ID` erzwingt den lokalen Ad-hoc-Modus ohne

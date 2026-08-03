@@ -105,7 +105,7 @@ class InstallerTest(unittest.TestCase):
     def assert_old_app_preserved(self):
         self.assertTrue(os.path.exists(os.path.join(self.app(), "sentinel")))
 
-    def test_install_builds_owned_signed_artifacts_with_actual_repo_path(self):
+    def test_install_builds_owned_signed_artifacts_with_bundle_relative_cli(self):
         self.install_ok()
 
         self.assertEqual(
@@ -136,8 +136,13 @@ class InstallerTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(decompiled.returncode, 0, decompiled.stderr)
-        self.assertIn(os.path.realpath(os.path.join(self.copy, "ncpin")),
-                      decompiled.stdout)
+        # Kein absoluter CLI-Pfad des Build-Macs mehr im Droplet: die App loest
+        # ihre eingebettete Kopie ueber das eigene Bundle auf.
+        self.assertNotIn(os.path.realpath(os.path.join(self.copy, "ncpin")),
+                         decompiled.stdout)
+        self.assertIn("path to me", decompiled.stdout)
+        self.assertIn("/Contents/Resources/ncpin", decompiled.stdout)
+        self.assertIn("/usr/bin/python3 ", decompiled.stdout)
         self.assertNotIn("/tmp/ncpin-app.log", decompiled.stdout)
         self.assertNotIn("logmsg", decompiled.stdout)
         self.assertIn("Finder-Zugriff wurde verweigert", decompiled.stdout)
@@ -145,6 +150,55 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("errNum is -1712", decompiled.stdout)
         self.assertIn("errNum is -1728", decompiled.stdout)
         self.assertIn('selectionStatus is "empty"', decompiled.stdout)
+
+    def test_app_bundle_carries_runnable_relocatable_cli(self):
+        # Die CLI liegt als Kopie im Bundle und wird bundle-relativ aufgerufen.
+        # Beweis: Bundle an einen anderen Ort verschieben und die Kopie dort
+        # ausfuehren — genau das macht ein aus dem DMG gezogenes Droplet.
+        self.install_ok()
+        with open(os.path.join(self.copy, "ncpin"), "rb") as fh:
+            original = fh.read()
+
+        for name in ("Lokal halten.app", "Speicher freigeben.app"):
+            with self.subTest(app=name):
+                embedded = os.path.join(self.app(name), "Contents",
+                                        "Resources", "ncpin")
+                self.assertTrue(os.path.isfile(embedded))
+                self.assertFalse(os.path.islink(embedded))
+                self.assertTrue(os.stat(embedded).st_mode & 0o111)
+                with open(embedded, "rb") as fh:
+                    self.assertEqual(fh.read(), original)
+
+        moved = os.path.join(self.root, "woanders", "Lokal halten.app")
+        os.makedirs(os.path.dirname(moved))
+        shutil.move(self.app(), moved)
+        version = subprocess.run(
+            ["/usr/bin/python3",
+             os.path.join(moved, "Contents", "Resources", "ncpin"),
+             "--version"],
+            env={"PATH": "/usr/bin:/bin"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertEqual(version.returncode, 0, version.stderr)
+        self.assertTrue(version.stdout.startswith("ncpin "), version.stdout)
+
+    def test_embedded_cli_is_sealed_by_the_signature(self):
+        # Die CLI-Kopie muss VOR dem Signieren im Bundle liegen, sonst waere sie
+        # nicht versiegelt und liesse sich nachtraeglich austauschen.
+        self.install_ok()
+        embedded = os.path.join(self.app(), "Contents", "Resources", "ncpin")
+        with open(embedded, "a", encoding="utf-8") as fh:
+            fh.write("\n# nachtraeglich veraendert\n")
+
+        verify = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", "--deep", self.app()],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        self.assertNotEqual(verify.returncode, 0, verify.stdout)
 
     def test_foreign_collisions_abort_without_force_and_force_replaces(self):
         foreign = self.app()
