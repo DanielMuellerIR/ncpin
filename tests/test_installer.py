@@ -185,6 +185,41 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("errNum is -1728", decompiled.stdout)
         self.assertIn('selectionStatus is "empty"', decompiled.stdout)
 
+    def test_quick_actions_call_the_cli_inside_the_installed_app(self):
+        """Die Quick Actions duerfen nicht den Repo-Pfad des Build-Macs rufen.
+
+        Ein .workflow-Bundle kann seinen eigenen Ort zur Laufzeit nicht
+        ermitteln — Automator fuehrt nur ein Shell-Skript aus —, es braucht also
+        einen absoluten Pfad. Bis 2026-08-04 stand dort der Pfad ins Repo:
+        Repo verschoben oder geloescht, Quick Action tot. Jetzt zeigt er in die
+        installierte App, deren Ort feststeht.
+        """
+        self.install_ok()
+        im_repo = os.path.realpath(os.path.join(self.copy, "ncpin"))
+
+        for workflow, app in (
+            ("Lokal halten (Nextcloud).workflow", "Lokal halten.app"),
+            ("Speicher freigeben (Nextcloud).workflow", "Speicher freigeben.app"),
+        ):
+            with self.subTest(workflow=workflow):
+                dokument = os.path.join(self.workflow(workflow), "Contents",
+                                        "document.wflow")
+                with open(dokument, "rb") as fh:
+                    inhalt = plistlib.load(fh)
+                text = str(inhalt)
+
+                erwartet = os.path.join(self.app(app), "Contents", "Resources",
+                                        "ncpin")
+                self.assertIn(erwartet, text)
+                self.assertNotIn(im_repo, text)
+                # Und die verstaendliche Meldung, falls die App fehlt.
+                self.assertIn("Die zugehoerige App fehlt", text)
+
+                # Der Pfad muss auch wirklich auf eine ausfuehrbare Datei
+                # zeigen — sonst waere der Test gruen und die Aktion trotzdem
+                # tot.
+                self.assertTrue(os.access(erwartet, os.X_OK), erwartet)
+
     def test_app_bundle_carries_runnable_relocatable_cli(self):
         # Die CLI liegt als Kopie im Bundle und wird bundle-relativ aufgerufen.
         # Beweis: Bundle an einen anderen Ort verschieben und die Kopie dort

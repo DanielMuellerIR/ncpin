@@ -314,10 +314,20 @@ notarize_app() {
 build_app local "lokal halten" "$BUILT_APP1" "$BUNDLE_BASE.local"
 build_app online "Speicher freigeben" "$BUILT_APP2" "$BUNDLE_BASE.online"
 
+# Die Quick Actions rufen die CLI-Kopie in der INSTALLIERTEN App auf, nicht die
+# im Repo. Ein .workflow-Bundle kann seinen eigenen Ort zur Laufzeit nicht
+# ermitteln — Automator fuehrt nur ein Shell-Skript aus —, also braucht es einen
+# absoluten Pfad. Der aus dem Repo waere der Pfad des Build-Macs: Repo
+# verschoben oder geloescht, Quick Action tot (gefunden am 2026-08-04). Der Pfad
+# in die App ist dagegen derselbe, den auch der Nutzer sieht, und ueberlebt
+# jeden Umzug des Repos. Preis: Wer die App aus $APPS entfernt, verliert auch
+# die Quick Action — das Skript sagt dann, woran es liegt.
 /usr/bin/python3 "$REPO/quickactions/make_quickaction.py" \
-	local "Lokal halten (Nextcloud)" "$NCPIN" "$BUILT_QA1" >/dev/null
+	local "Lokal halten (Nextcloud)" "$APP1/Contents/Resources/ncpin" \
+	"$BUILT_QA1" >/dev/null
 /usr/bin/python3 "$REPO/quickactions/make_quickaction.py" \
-	online "Speicher freigeben (Nextcloud)" "$NCPIN" "$BUILT_QA2" >/dev/null
+	online "Speicher freigeben (Nextcloud)" "$APP2/Contents/Resources/ncpin" \
+	"$BUILT_QA2" >/dev/null
 
 if [ -n "$SIGN_ID" ] && [ "$NOTARIZE" = "1" ]; then
 	notarize_app "$BUILT_APP1"

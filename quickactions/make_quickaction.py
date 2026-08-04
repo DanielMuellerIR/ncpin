@@ -12,7 +12,11 @@ Aufruf:
   make_quickaction.py <action> <menü-titel> <ncpin-pfad> <ausgabe-bundle>
     action      "local" oder "online"
     menü-titel  Text im Rechtsklick-Menü (z.B. "Lokal halten (Nextcloud)")
-    ncpin-pfad  absoluter Pfad zur ncpin-CLI
+    ncpin-pfad  absoluter Pfad zur ncpin-CLI. install.sh übergibt hier die
+                Kopie in der INSTALLIERTEN App, nicht die im Repo: Ein
+                .workflow-Bundle kann seinen eigenen Ort zur Laufzeit nicht
+                ermitteln, braucht also einen absoluten Pfad — und der ins Repo
+                wäre der des Build-Macs und damit nach einem Umzug tot.
     ausgabe     Zielpfad des .workflow-Bundles
 """
 
@@ -35,10 +39,19 @@ def build(action, title, ncpin, out_bundle):
         note = "werden lokal geholt"
     else:
         note = "Speicher freigegeben"
+    # Der Pfad zeigt in die installierte App (siehe install.sh). Fehlt sie, wuerde
+    # zsh nur "command not found" liefern und die Meldung unten "Fehler (Code
+    # 127)" anzeigen — daran erkennt niemand die Ursache. Deshalb vorher
+    # nachsehen und im Klartext sagen, was fehlt.
     command = (
         '#!/bin/zsh\n'
         '# Eingabe kommt als Argumente (inputMethod=1).\n'
-        '%s %s "$@"\n'
+        'ncpin=%s\n'
+        'if [ ! -x "$ncpin" ]; then\n'
+        '  /usr/bin/osascript -e \'display notification "Die zugehoerige App fehlt — bitte ncpin neu installieren." with title "ncpin"\'\n'
+        '  exit 1\n'
+        'fi\n'
+        '"$ncpin" %s "$@"\n'
         'rc=$?\n'
         'if [ $rc -eq 0 ]; then\n'
         '  /usr/bin/osascript -e \'display notification "%s" with title "Nextcloud"\'\n'
