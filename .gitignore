@@ -4,3 +4,7 @@ build/
 # Gebaute Artefakte liegen ausserhalb des Repos (~/Applications, ~/Library/Services).
 scratch/
 .commit-lock
+# Python-Bytecode der py_compile-Pruefung. Das System-Python (/usr/bin/python3)
+# legt ihn ausserhalb des Repos ab, ein Homebrew-python3 dagegen im Arbeitsbaum.
+__pycache__/
+*.pyc
