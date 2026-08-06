@@ -71,7 +71,9 @@ previously installed version. Without a certificate it falls back to local ad-ho
 build works locally (on first launch you may need to right-click → Open once), but it is **never**
 installed into `/Applications`: that folder holds bundles with a stapled notarization ticket only.
 The installer stops with exit code 2 before it builds anything, and the same applies to
-`NCPIN_NOTARIZE=0`. Choose one of these instead:
+`NCPIN_NOTARIZE=0`. A plain build (`./build.sh <dir>` or `./install.sh --stage-only <dir>`) also
+refuses `/Applications` with exit code 2 — that path checks neither ticket nor collision.
+Choose one of these instead:
 
 ```sh
 ./build.sh                            # apps stay in the project folder build/

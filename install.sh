@@ -15,6 +15,12 @@ NCPIN="$REPO/ncpin"
 # einen Ad-hoc-Build abzulegen (siehe target_needs_notary_ticket).
 # ~/Applications wurde dabei geräumt — wer es dennoch braucht, setzt NCPIN_APPS_DIR.
 APPS="${NCPIN_APPS_DIR:-/Applications}"
+# NCPIN_APPS_DIR darf relativ gesetzt sein, der Pfad muss aber absolut werden:
+# Die Quick Actions bekommen den App-Pfad fest eingebaut, und Automator loest
+# einen relativen Pfad spaeter gegen ein ANDERES Arbeitsverzeichnis auf — die
+# App waere korrekt installiert und die Quick Action trotzdem tot. :a macht
+# absolut, ohne Symlinks aufzuloesen (das erledigt is_protected_dir separat).
+APPS="${APPS:a}"
 SVC="${NCPIN_SERVICES_DIR:-$HOME/Library/Services}"
 LINKDIR_OVERRIDE="${NCPIN_LINK_DIR:-}"
 APP1="$APPS/Lokal halten.app"
@@ -198,15 +204,31 @@ case "$NOTARIZE" in 0|1) ;; *) print -u2 -- "NCPIN_NOTARIZE muss 0 oder 1 sein";
 # In /Applications liegen ausschliesslich Bundles mit angeheftetem
 # Notary-Ticket. Ein ad-hoc oder nur signierter Build darf dort nie landen —
 # lieber gar nicht installieren als unnotarisiert.
-target_needs_notary_ticket() {
+is_protected_dir() {  # $1 = zu pruefendes Verzeichnis
 	# :A macht den Pfad absolut und loest Symlinks auf, damit weder ein
-	# relatives NCPIN_APPS_DIR noch ein Umweg ueber einen Symlink die Regel
-	# umgeht.
-	case "${APPS:A}" in
+	# relatives Ziel noch ein Umweg ueber einen Symlink die Regel umgeht.
+	case "${1:A}" in
 		/Applications|/Applications/*) return 0 ;;
 	esac
 	return 1
 }
+
+target_needs_notary_ticket() {
+	is_protected_dir "$APPS"
+}
+
+# --stage-only baut nur heraus: Es prueft weder Ticket noch Kollision und
+# entfernt am Zielort gleichnamige Artefakte mit rm -rf. Genau deshalb darf es
+# nie ins geschuetzte Verzeichnis schreiben — sonst waere "./build.sh
+# /Applications" ein Weg an beiden Schranken vorbei.
+if [ "$STAGE_ONLY" -eq 1 ] && is_protected_dir "$STAGE_DIR"; then
+	print -u2 -- "FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen."
+	print -u2 -- "Dort liegen ausschliesslich installierte, notarisierte Bundles."
+	print -u2 -- "Stattdessen:"
+	print -u2 -- "  ./build.sh                          # baut nach build/ im Projektordner"
+	print -u2 -- "  ./install.sh                        # installiert notarisiert nach $APPS"
+	exit 2
+fi
 
 # Fail-closed und bewusst VOR der Kollisionspruefung: Wer ohne Zertifikat nach
 # /Applications installieren will, soll genau das erklaert bekommen und nicht
@@ -378,6 +400,23 @@ remove_stage() {
 	if path_exists "$stage"; then rm -rf -- "$stage"; fi
 }
 
+# Nach einem Swap liegt der herausgetauschte alte Stand am Stage-Pfad. Ist das
+# ein FREMDES Artefakt, wurde das Ziel im Fenster zwischen Kollisionspruefung
+# und Austausch ersetzt (die Kopie davor dauert). remove_stage wuerde es dann
+# vernichten, obwohl ohne --force nichts Fremdes angefasst werden darf. Also
+# zurücktauschen und abbrechen. Gibt immer 0 zurueck; der Aufrufer meldet den
+# Fehlschlag.
+rollback_foreign_swapout() {  # $1=stage $2=ziel
+	local stage="$1" destination="$2"
+	if /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$destination" "$stage"; then
+		remove_stage "$stage"
+		print -u2 -- "Kollision: $destination wurde waehrend der Installation ersetzt."
+		print -u2 -- "Das fremde Artefakt wurde zurueckgelegt; nichts installiert."
+	else
+		print -u2 -- "FEHLER: Ruecktausch fehlgeschlagen — fremdes Artefakt liegt unter $stage."
+	fi
+}
+
 install_tree() {
 	local source="$1" destination="$2" owner="$3" parent stage
 	# Der Build kann dauern. Deshalb unmittelbar vor jedem Austausch erneut
@@ -390,7 +429,13 @@ install_tree() {
 		remove_stage "$stage"
 		return 1
 	fi
-	# Bei einem Swap liegt der verifizierte alte Stand jetzt am Stage-Pfad.
+	# Bei einem Swap liegt der alte Stand jetzt am Stage-Pfad — nur ein als
+	# ncpin-eigen markierter darf hier geloescht werden.
+	if [ "$FORCE" -eq 0 ] && path_exists "$stage" \
+			&& ! is_owned_tree "$stage" "$owner"; then
+		rollback_foreign_swapout "$stage" "$destination"
+		return 1
+	fi
 	remove_stage "$stage"
 }
 
@@ -403,6 +448,10 @@ install_link() {
 	ln -s "$NCPIN" "$stage"
 	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
 		remove_stage "$stage"
+		return 1
+	fi
+	if [ "$FORCE" -eq 0 ] && path_exists "$stage" && ! is_owned_link "$stage"; then
+		rollback_foreign_swapout "$stage" "$destination"
 		return 1
 	fi
 	remove_stage "$stage"

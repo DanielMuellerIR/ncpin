@@ -146,6 +146,13 @@ print -r -- "$ATTACH_OUT"
 ATTACHED_DEV="$(print -r -- "$ATTACH_OUT" \
 	| awk -v m="$MOUNT_DIR" -v r="${MOUNT_DIR:A}" '$NF == m || $NF == r {print $1; exit}')"
 if [ -z "$ATTACHED_DEV" ]; then
+	# Fail-closed, aber nichts haengen lassen: Das Image IST hier bereits
+	# eingebunden. Ohne gemerkten Geraeteknoten wuerde der Exit-Trap es liegen
+	# lassen und der Mountpoint jeden Folgelauf blockieren. Der erste
+	# /dev/-Eintrag der EIGENEN Attach-Ausgabe gehoert sicher zu diesem Lauf —
+	# er wird nur zum Trennen gemerkt, weitergearbeitet wird trotzdem nicht.
+	ATTACHED_DEV="$(print -r -- "$ATTACH_OUT" \
+		| awk '$1 ~ "^/dev/" {print $1; exit}')"
 	print -u2 -- "FEHLER: Geraeteknoten des eigenen Attach nicht ermittelbar."
 	exit 1
 fi

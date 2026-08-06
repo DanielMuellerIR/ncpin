@@ -72,7 +72,9 @@ der vorher installierte Stand bleibt erhalten. Ohne Zertifikat fällt der Instal
 Ad-hoc-Signierung zurück; ein solcher Build läuft lokal (beim ersten Start ggf. einmal Rechtsklick
 → Öffnen), wird aber **nie** nach `/Applications` installiert: Dort liegen ausschließlich Bundles
 mit angeheftetem Notary-Ticket. Der Installer bricht mit Exit-Code 2 ab, noch bevor er etwas baut;
-für `NCPIN_NOTARIZE=0` gilt dasselbe. Stattdessen:
+für `NCPIN_NOTARIZE=0` gilt dasselbe. Auch ein reiner Build (`./build.sh <ziel>` beziehungsweise
+`./install.sh --stage-only <ziel>`) verweigert `/Applications` mit Exit-Code 2 — dieser Weg prüft
+weder Notary-Ticket noch Kollision. Stattdessen:
 
 ```sh
 ./build.sh                            # Apps bleiben im Projektordner build/

@@ -320,8 +320,37 @@ def _ondisk_representation(sample):
     return _resolve_existing(sample)
 
 
+# Nachbeobachtung nach einem fehlgeschlagenen Uebergang: MAKE-Befehle und
+# Rename-Wuensche sind fire-and-forget — der Client kann sie auch nach dem
+# Wait-Timeout noch ausfuehren. Ohne dieses Fenster wuerde der Bench den
+# unveraenderten Anfangszustand sofort als "wiederhergestellt" melden und
+# enden, waehrend das Fixture kurz danach umkippt. Als Anzahl statt Dauer
+# formuliert, damit Tests es deterministisch klein setzen koennen.
+SETTLE_POLLS = 6
+SETTLE_PAUSE = 0.5
+
+
+def _settle_after_failed_transition(runner, sample, initial_state,
+                                    initial_ondisk, state, probe, ondisk):
+    """Beobachtet nach einem fehlgeschlagenen Uebergang kurz nach.
+
+    Startet mit der bereits gelesenen Beobachtung und gibt die letzte zurueck
+    (Zustand, Messwerte, On-Disk-Pfad). Bricht ab, sobald Zustand oder Pfad vom
+    Anfang abweichen — dann hat der bereits gesendete Befehl verspaetet
+    gewirkt, und die Wiederherstellung muss ihn aktiv zuruecknehmen.
+    """
+    for _ in range(SETTLE_POLLS):
+        if state != initial_state or (initial_ondisk is not None
+                                      and ondisk != initial_ondisk):
+            break
+        time.sleep(SETTLE_PAUSE)
+        state, probe = read_status_state(runner, sample)
+        ondisk = _ondisk_representation(sample)
+    return state, probe, ondisk
+
+
 def _revert_pending_transition(runner, sample, timeout, initial_state,
-                               initial_ondisk, result):
+                               initial_ondisk, result, current_state=None):
     """Nimmt einen ausstehenden Rename-Uebergang transportgerecht zurueck.
 
     Der Plan ergibt sich aus dem On-Disk-Pfad, nicht aus dem abstrakten
@@ -329,14 +358,16 @@ def _revert_pending_transition(runner, sample, timeout, initial_state,
       - Anfangs online-only, jetzt suffixlos: Der Downloadwunsch steht. Ein
         1-Byte-Stub laesst sich nicht direkt zurueckdrehen (ncpin sieht dort
         "nichts zu tun") — also erst fertig hydrieren lassen ("local"), dann
-        wieder dehydrieren ("online").
+        wieder dehydrieren ("online"). Ist die Datei ausweislich
+        ``current_state`` schon fertig hydriert, entfaellt dieser Schritt:
+        Er waere ein wirkungsloser zweiter CLI-Aufruf.
       - Anfangs lokal, jetzt suffigiert: Die Rueck-Umbenennung ("local")
         genuegt; der Inhalt liegt noch (oder wieder) vor.
     Gibt True nur zurueck, wenn am Ende Zustand UND Pfad dem Anfang
     entsprechen.
     """
     if initial_ondisk.endswith(SUFFIX):
-        plan = ["local", "online"]
+        plan = ["online"] if current_state == "local" else ["local", "online"]
     else:
         plan = ["local"]
     for step_target in plan:
@@ -400,6 +431,15 @@ def roundtrip(runner, sample, timeout):
         # erneut verifiziert.
         current_state, restore_probe = read_status_state(runner, sample)
         current_ondisk = _ondisk_representation(sample)
+        if not transition_ok:
+            # Der Zielbefehl wurde gesendet, wirkte aber (noch) nicht. Weil er
+            # fire-and-forget ist, reicht eine einzelne Abfrage nicht: kurz
+            # nachbeobachten, statt den Anfangszustand sofort als erhalten zu
+            # melden.
+            current_state, restore_probe, current_ondisk = \
+                _settle_after_failed_transition(
+                    runner, sample, initial_state, initial_ondisk,
+                    current_state, restore_probe, current_ondisk)
         result["restore_probe"] = restore_probe
         result["restore_ondisk"] = current_ondisk
         path_stable = (initial_ondisk is None
@@ -411,7 +451,8 @@ def roundtrip(runner, sample, timeout):
             # Der Pfadname weicht ab -> ein Rename-Uebergang steht noch aus,
             # auch wenn der abstrakte Zustand scheinbar schon wieder passt.
             result["restore_verified"] = _revert_pending_transition(
-                runner, sample, timeout, initial_state, initial_ondisk, result)
+                runner, sample, timeout, initial_state, initial_ondisk, result,
+                current_state=current_state)
         elif current_state in ("local", "online"):
             dt, rc, out, err = run_ncpin(
                 runner, [initial_state, sample, "--wait", "--timeout", str(timeout)])

@@ -129,9 +129,9 @@ class InstallerTest(unittest.TestCase):
         os.chmod(target, 0o755)
         return target
 
-    def run_patched_installer(self, env):
+    def run_patched_installer(self, env, *arguments):
         return subprocess.run(
-            ["/bin/zsh", self.patched_installer()],
+            ["/bin/zsh", self.patched_installer()] + list(arguments),
             cwd=self.copy,
             env=env,
             stdout=subprocess.PIPE,
@@ -438,6 +438,96 @@ class InstallerTest(unittest.TestCase):
         # die normale Arbeitsweise — die Regel sperrt nur /Applications.
         self.install_ok()
         self.assertTrue(os.path.isdir(self.app()))
+
+    def test_stage_only_refuses_the_protected_target(self):
+        # --stage-only prueft weder Notary-Ticket noch Kollision und entfernt am
+        # Zielort gleichnamige Artefakte mit rm -rf. Ins geschuetzte Verzeichnis
+        # darf es deshalb gar nicht erst bauen — sonst waere es der Weg an
+        # beiden Schranken vorbei. Der installierte Stand bleibt unberuehrt.
+        self.install_ok()
+        open(os.path.join(self.app(), "sentinel"), "w").close()
+
+        result = self.run_patched_installer(self.env, "--stage-only", self.apps)
+
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertIn("--stage-only darf nicht", result.stderr)
+        self.assert_old_app_preserved()
+
+    def test_relative_apps_dir_becomes_absolute_in_the_quick_actions(self):
+        # NCPIN_APPS_DIR darf relativ gesetzt werden. In der Quick Action muss
+        # aber ein absoluter Pfad landen: Automator loest ihn spaeter gegen ein
+        # anderes Arbeitsverzeichnis auf und meldete die App sonst als fehlend.
+        env = self.env.copy()
+        env["NCPIN_APPS_DIR"] = os.path.join("..", "targets", "relative-apps")
+
+        result = self.run_installer(env=env)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+        erwartet = os.path.join(
+            os.path.realpath(self.root), "targets", "relative-apps",
+            "Lokal halten.app", "Contents", "Resources", "ncpin")
+        dokument = os.path.join(self.workflow(), "Contents", "document.wflow")
+        with open(dokument, "rb") as fh:
+            text = str(plistlib.load(fh))
+
+        self.assertIn(erwartet, text)
+        self.assertNotIn("../targets/relative-apps", text)
+        # Der eingebettete Pfad muss auch wirklich auf die CLI zeigen.
+        self.assertTrue(os.access(erwartet, os.X_OK), erwartet)
+
+    def test_second_install_replaces_the_own_previous_state(self):
+        # Der Normalfall: erneut installieren. Dabei laeuft der Swap-Zweig ueber
+        # den EIGENEN alten Stand — der darf weiterhin ersetzt und aufgeraeumt
+        # werden (die Fremd-Schranke gilt nur fuer nicht markierte Artefakte).
+        self.install_ok()
+        sentinel = os.path.join(self.app(), "sentinel")
+        open(sentinel, "w").close()
+
+        self.install_ok()
+
+        self.assertFalse(os.path.exists(sentinel))
+        self.assertEqual(self.plist(self.app())["NCPINOwnerIdentifier"],
+                         "com.ethermac.ncpin.local")
+        self.assertTrue(os.path.lexists(os.path.join(self.links, "ncpin")))
+        # Kein liegengebliebenes Stage-Verzeichnis im Zielordner.
+        self.assertEqual(
+            [name for name in os.listdir(self.apps)
+             if name.startswith(".ncpin-stage")], [])
+
+    def test_target_replaced_during_copy_is_rolled_back_not_deleted(self):
+        # Rennen im "Ziel existiert"-Zweig: Beim Preflight lag dort der eigene
+        # Stand, waehrend des Kopierens wird er durch ein fremdes Artefakt
+        # ersetzt. RENAME_SWAP tauscht bedingungslos — das fremde Artefakt lag
+        # danach am Stage-Pfad und wurde mitgeloescht. Ohne --force muss es
+        # stattdessen zurueckgetauscht und der Lauf abgebrochen werden.
+        self.install_ok()
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        # Der Shim ersetzt das Ziel unmittelbar vor dem atomaren Austausch —
+        # genau das Fenster, das die vorherige Kopie offen laesst — und ruft
+        # danach die ECHTE Implementierung aus dem Repo auf.
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, shutil, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1], sys.argv[2]\n"
+                "if os.path.basename(destination) == 'Lokal halten.app':\n"
+                "    shutil.rmtree(destination)\n"
+                "    os.makedirs(destination)\n"
+                "    open(os.path.join(destination, 'foreign-data'), 'w').close()\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                % os.path.join(REPO, "tools"))
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Kollision", result.stderr)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.app(), "foreign-data")))
+        # Kein liegengebliebenes Stage-Verzeichnis im Zielordner.
+        self.assertEqual(
+            [name for name in os.listdir(self.apps)
+             if name.startswith(".ncpin-stage")], [])
 
     def test_stage_only_and_uninstall_are_mutually_exclusive(self):
         # "Nur bauen" darf niemals nebenbei deinstallieren: die Kombination

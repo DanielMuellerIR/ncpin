@@ -546,13 +546,30 @@ class RenameTransportTests(unittest.TestCase):
             handle.write(b" ")
         return full
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, race=None):
+        """Fuehrt die CLI gegen die Fixtures aus.
+
+        ``race`` ist ein Rueckruf, der beim Client-Check laeuft. Der findet in
+        rename_do_action GENAU zwischen der Grenzpruefung (checked_path) und
+        dem Oeffnen des Verzeichnisses statt und ist damit ein
+        deterministischer Aufhaenger fuer TOCTOU-Szenarien — ohne Threads und
+        ohne Warten.
+        """
         stdout = io.StringIO()
         stderr = io.StringIO()
+        if race is None:
+            client_patch = mock.patch.object(
+                self.ncpin, "client_process_running", return_value=True)
+        else:
+            def running_after_race():
+                race()
+                return True
+            client_patch = mock.patch.object(
+                self.ncpin, "client_process_running",
+                side_effect=running_after_race)
         with mock.patch.object(self.ncpin, "discover_socket_with_paths",
                                return_value=(None, [])), \
-                mock.patch.object(self.ncpin, "client_process_running",
-                                  return_value=True), \
+                client_patch, \
                 mock.patch.dict(os.environ, {"NCPIN_CONFIG": self.cfg,
                                              "NCPIN_SOCKET": ""}), \
                 contextlib.redirect_stdout(stdout), \
@@ -757,12 +774,11 @@ class RenameTransportTests(unittest.TestCase):
 
         self.assertFalse(reached)
 
-    def test_traversal_is_anchored_against_directory_symlink_swap(self):
-        # Simuliert das TOCTOU-Fenster der frueheren os.walk-Traversierung:
-        # os.path.islink meldet (wie nach einem Austausch KURZ NACH der
-        # Pruefung) faelschlich "kein Symlink". Die an Verzeichnis-fds
-        # verankerte Traversierung (O_NOFOLLOW) darf dem Symlink trotzdem
-        # nicht folgen und nichts ausserhalb der Syncwurzel umbenennen.
+    def test_traversal_never_descends_into_a_symlinked_subdirectory(self):
+        # Ein Symlink im Ordner darf beim rekursiven Lauf nie betreten werden.
+        # Die an Verzeichnis-fds verankerte Traversierung erkennt ihn ueber
+        # DirEntry.is_symlink() und laesst ihn aus; ausserhalb der Syncwurzel
+        # wird nichts umbenannt.
         outside_placeholder = os.path.join(
             self.outside, "geheim.txt") + self.ncpin.SUFFIX
         with open(outside_placeholder, "wb") as handle:
@@ -772,9 +788,7 @@ class RenameTransportTests(unittest.TestCase):
         inside_placeholder = self.make_placeholder("ordner/drin.txt")
         os.symlink(self.outside, os.path.join(folder, "evil"))
 
-        with mock.patch.object(self.ncpin.os.path, "islink",
-                               return_value=False):
-            rc, _out, _err = self.run_cli("local", folder)
+        rc, _out, _err = self.run_cli("local", folder)
 
         self.assertEqual(rc, 0)
         # Innerhalb der Wurzel wurde gearbeitet, ausserhalb nicht.
@@ -782,6 +796,99 @@ class RenameTransportTests(unittest.TestCase):
         self.assertTrue(os.path.exists(outside_placeholder))
         self.assertFalse(os.path.exists(
             os.path.join(self.outside, "geheim.txt")))
+
+    def test_intermediate_directory_swap_after_check_cannot_escape_root(self):
+        # Echtes TOCTOU-Fenster: NACH checked_path() wird ein ZWISCHEN-
+        # verzeichnis des Pfads durch einen Symlink nach draussen ersetzt.
+        # os.open(pfad, O_NOFOLLOW) haette dem gefolgt (O_NOFOLLOW schuetzt nur
+        # die letzte Komponente) und ausserhalb der Syncwurzel umbenannt.
+        # Der komponentenweise Aufbau muss hier scheitern statt auszubrechen.
+        inside_placeholder = self.make_placeholder("zwischen/tief/datei.txt")
+        os.makedirs(os.path.join(self.outside, "tief"))
+        outside_placeholder = os.path.join(
+            self.outside, "tief", "datei.txt") + self.ncpin.SUFFIX
+        with open(outside_placeholder, "wb") as handle:
+            handle.write(b" ")
+        logical = os.path.join(self.root, "zwischen", "tief", "datei.txt")
+
+        def swap_intermediate_for_symlink():
+            victim = os.path.join(self.root, "zwischen")
+            os.rename(victim, victim + ".weg")
+            os.symlink(self.outside, victim)
+
+        rc, _out, _err = self.run_cli("local", logical,
+                                      race=swap_intermediate_for_symlink)
+
+        self.assertEqual(rc, 1)
+        # Ausserhalb wurde nichts angefasst; der echte Platzhalter liegt noch da.
+        self.assertTrue(os.path.exists(outside_placeholder))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.outside, "tief", "datei.txt")))
+        self.assertTrue(os.path.exists(
+            inside_placeholder.replace("/zwischen/", "/zwischen.weg/")))
+
+    def test_folder_action_reports_failed_rename_instead_of_swallowing_it(self):
+        # Ein echter Dateisystemfehler (hier EPERM) ist kein Verschwinde-Rennen.
+        # Er darf nicht still uebergangen werden: Die Datei liegt unveraendert
+        # da, also muss der Lauf Exit 1 melden statt Erfolg vorzutaeuschen.
+        logical = self.make_file("ordner/wichtig.txt", b"voller inhalt")
+        folder = os.path.join(self.root, "ordner")
+
+        def refuse(dirfd, source_name, target_name):
+            raise PermissionError(1, "Operation not permitted", target_name)
+
+        with mock.patch.object(self.ncpin, "_rename_excl_at",
+                               side_effect=refuse):
+            rc, out, _err = self.run_cli("online", "--json", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("übersprungen", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(logical))
+        self.assertFalse(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_dehydration_reads_metadata_after_loading_the_journal(self):
+        # Das Journal wird beim ersten Zugriff geklont und ausgelesen; das
+        # dauert. Aendert der Nutzer die Datei in genau diesem Fenster, darf
+        # ncpin nicht gegen die vorher gelesenen Werte pruefen und den neuen
+        # Inhalt freigeben — der Client wuerde die Umbenennung still ignorieren.
+        logical = self.make_file("waechst.txt", b"kurz")
+        original_load = self.ncpin._load_journal_entries
+
+        def slow_load(folder):
+            entries = original_load(folder)
+            with open(logical, "wb") as handle:
+                handle.write(b"viel laengerer neuer inhalt")
+            return entries
+
+        with mock.patch.object(self.ncpin, "_load_journal_entries",
+                               side_effect=slow_load):
+            rc, out, _err = self.run_cli("online", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("noch nicht gesynct", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(logical))
+        self.assertFalse(os.path.exists(logical + self.ncpin.SUFFIX))
+
+    def test_folder_state_exact_reports_unreadable_subtree_as_unknown(self):
+        # os.walk uebergeht einen nicht lesbaren Unterordner STILL. Im exakten
+        # Modus darf daraus nie "alles lokal" werden: toggle wuerde sonst seine
+        # Richtung aus einem unvollstaendigen Baum ableiten.
+        self.make_file("baum/sichtbar.txt")
+        gesperrt = os.path.join(self.root, "baum", "gesperrt")
+        os.makedirs(gesperrt)
+        with open(os.path.join(gesperrt, "drin.txt") + self.ncpin.SUFFIX,
+                  "wb") as handle:
+            handle.write(b" ")
+        folder = os.path.join(self.root, "baum")
+
+        os.chmod(gesperrt, 0o000)
+        try:
+            self.assertEqual(
+                self.ncpin.fs_folder_state(folder, exact=True), "unknown")
+            # Die unverbindliche Anzeige-Stichprobe darf weiterhin antworten.
+            self.assertEqual(self.ncpin.fs_folder_state(folder), "local")
+        finally:
+            os.chmod(gesperrt, 0o755)
 
     def test_exclusive_rename_refuses_when_target_appears(self):
         # Der exklusive Rename (renameatx_np + RENAME_EXCL) darf ein parallel

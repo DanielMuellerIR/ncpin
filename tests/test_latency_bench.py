@@ -157,10 +157,22 @@ class RoundtripTests(unittest.TestCase):
         commands = [call.args[1][0] for call in run.call_args_list]
         self.assertEqual(commands, ["status", "online", "status", "status", "local", "status"])
 
+    def settle_quickly(self, polls=2):
+        """Macht das Nachbeobachtungsfenster im Test kurz und wartefrei."""
+        for attribute, value in (("SETTLE_POLLS", polls), ("SETTLE_PAUSE", 0)):
+            patcher = mock.patch.object(self.bench, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def test_failed_transition_does_not_blindly_run_counteroperation(self):
+        # Der Uebergang scheitert und der Zustand bleibt ueber das ganze
+        # Nachbeobachtungsfenster beim Anfang: keine Gegenoperation noetig.
+        self.settle_quickly()
         calls = [
             status_result("local"),
             (0.2, 1, "", "Fehler"),
+            status_result("local"),
+            status_result("local"),
             status_result("local"),
             status_result("local"),
         ]
@@ -170,7 +182,31 @@ class RoundtripTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["restore_verified"])
         commands = [call.args[1][0] for call in run.call_args_list]
-        self.assertEqual(commands, ["status", "online", "status", "status"])
+        self.assertEqual(commands, ["status"] + ["online"] + ["status"] * 4)
+
+    def test_late_effect_after_wait_timeout_is_restored_not_declared_verified(self):
+        # MAKE-Befehle sind fire-and-forget: Nach dem Wait-Timeout sieht die
+        # erste Abfrage noch den Anfangszustand, der Client fuehrt den Befehl
+        # aber kurz danach doch aus. Eine einzelne Abfrage wuerde hier
+        # faelschlich "wiederhergestellt" melden und enden.
+        self.settle_quickly()
+        calls = [
+            status_result("local"),      # Anfangszustand
+            (0.2, 1, "", "Timeout"),     # online: --wait laeuft ab
+            status_result("local"),      # Beobachtung direkt danach
+            status_result("local"),      # erste Abfrage im finally
+            status_result("online"),     # Nachbeobachtung: Befehl wirkt doch
+            (0.2, 0, "local ✓", ""),     # aktive Wiederherstellung
+            status_result("local"),
+        ]
+        with mock.patch.object(self.bench, "run_ncpin", side_effect=calls) as run:
+            result = self.bench.roundtrip(self.runner, self.sample, 5.0)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restore_verified"])
+        commands = [call.args[1][0] for call in run.call_args_list]
+        self.assertEqual(commands, ["status", "online", "status", "status",
+                                    "status", "local", "status"])
 
     def test_failed_transition_is_restored_when_state_did_change(self):
         calls = [
@@ -276,6 +312,38 @@ class RenameTransportRoundtripTests(unittest.TestCase):
         self.assertEqual(self.verbs,
                          ["status", "local", "status", "status",
                           "local", "status", "online", "status", "status"])
+
+    def test_successful_roundtrip_from_placeholder_skips_redundant_hydration(self):
+        # Anfangs online-only, die Hydrierung gelingt vollstaendig: Der Pfad
+        # ist danach suffixlos und der Zustand sicher "local". Fuer die
+        # Wiederherstellung genuegt dann die Dehydrierung — ein zweiter
+        # "local"-Aufruf waere ein wirkungsloser CLI-Start mit Statusabfrage.
+        with open(self.placeholder, "wb") as handle:
+            handle.write(b" ")
+
+        def download():
+            os.rename(self.placeholder, self.logical)
+            with open(self.logical, "wb") as handle:
+                handle.write(b"voller inhalt")
+
+        def dehydrate():
+            os.rename(self.logical, self.placeholder)
+            with open(self.placeholder, "wb") as handle:
+                handle.write(b" ")
+
+        effects = [("local", download, 0), ("online", dehydrate, 0)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 5.0)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["restore_verified"])
+        self.assertEqual(effects, [])
+        self.assertTrue(os.path.exists(self.placeholder))
+        self.assertFalse(os.path.exists(self.logical))
+        self.assertEqual(self.verbs,
+                         ["status", "local", "status", "status",
+                          "online", "status", "status"])
 
     def test_pending_dehydration_rename_is_rolled_back_despite_unknown_state(self):
         # Wait-Timeout nach dem Dehydrierungs-Rename: Die Suffixdatei traegt
