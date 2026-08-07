@@ -164,17 +164,24 @@ class RoundtripTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_failed_transition_does_not_blindly_run_counteroperation(self):
+    def test_failed_transition_reasserts_initial_state_before_verifying(self):
         # Der Uebergang scheitert und der Zustand bleibt ueber das ganze
-        # Nachbeobachtungsfenster beim Anfang: keine Gegenoperation noetig.
+        # Nachbeobachtungsfenster beim Anfang. Das ist bei fire-and-forget KEIN
+        # Beweis (AGENTS: "Ein Timeout beweist bei fire-and-forget nichts") —
+        # der gesendete Befehl kann auch danach noch wirken. Der Anfangszustand
+        # wird deshalb aktiv erneut beauftragt und nachgeprueft; die
+        # Gegenrichtung des Anfangszustands wird dabei nie ein zweites Mal
+        # gesendet.
         self.settle_quickly()
         calls = [
-            status_result("local"),
-            (0.2, 1, "", "Fehler"),
-            status_result("local"),
-            status_result("local"),
-            status_result("local"),
-            status_result("local"),
+            status_result("local"),      # Anfangszustand
+            (0.2, 1, "", "Fehler"),      # online: schlaegt fehl
+            status_result("local"),      # Beobachtung direkt danach
+            status_result("local"),      # erste Abfrage im finally
+            status_result("local"),      # Nachbeobachtung 1
+            status_result("local"),      # Nachbeobachtung 2
+            (0.2, 0, "lokal ✓", ""),     # aktive Wiederbeauftragung
+            status_result("local"),      # Nachweis
         ]
         with mock.patch.object(self.bench, "run_ncpin", side_effect=calls) as run:
             result = self.bench.roundtrip(self.runner, self.sample, 5.0)
@@ -182,7 +189,35 @@ class RoundtripTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["restore_verified"])
         commands = [call.args[1][0] for call in run.call_args_list]
-        self.assertEqual(commands, ["status"] + ["online"] + ["status"] * 4)
+        self.assertEqual(commands, ["status", "online"] + ["status"] * 4
+                         + ["local", "status"])
+        self.assertEqual(commands.count("online"), 1)
+
+    def test_transient_unknown_keeps_the_settle_window_open(self):
+        # read_status_state() meldet schon bei einem einzelnen Status-, Exit-
+        # Code- oder JSON-Fehler "unknown". Das darf das Nachbeobachtungsfenster
+        # nicht beenden: Sonst wird die Wiederherstellung verweigert, obwohl der
+        # naechste Poll wieder einen sicheren Zustand liefert — und genau dort
+        # zeigt sich die verspaetete Wirkung des gesendeten Befehls.
+        self.settle_quickly()
+        calls = [
+            status_result("local"),      # Anfangszustand
+            (0.2, 1, "", "Timeout"),     # online: --wait laeuft ab
+            status_result("local"),      # Beobachtung direkt danach
+            status_result("unknown"),    # erste Abfrage im finally: Lesefehler
+            status_result("online"),     # Nachbeobachtung: Befehl wirkt doch
+            (0.2, 0, "lokal ✓", ""),     # aktive Wiederherstellung
+            status_result("local"),      # Nachweis
+        ]
+        with mock.patch.object(self.bench, "run_ncpin", side_effect=calls) as run:
+            result = self.bench.roundtrip(self.runner, self.sample, 5.0)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restore_verified"])
+        self.assertNotIn("error", result)
+        commands = [call.args[1][0] for call in run.call_args_list]
+        self.assertEqual(commands, ["status", "online", "status", "status",
+                                    "status", "local", "status"])
 
     def test_late_effect_after_wait_timeout_is_restored_not_declared_verified(self):
         # MAKE-Befehle sind fire-and-forget: Nach dem Wait-Timeout sieht die

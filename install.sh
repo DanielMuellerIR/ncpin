@@ -82,8 +82,12 @@ plist_owner() {
 		"$artifact/Contents/Info.plist" 2>/dev/null || true
 }
 
+# Ein Verzeichnis-SYMLINK ist kein eigener Baum: PlistBuddy wuerde ihm zum
+# Besitzmarker des Zielbundles folgen, und ein fremder Symlink auf ein
+# markiertes ncpin-Bundle gaelte dann als ncpin-eigen — Installation und
+# Uninstall duerften ihn ohne --force entfernen. Deshalb erst -L ausschliessen.
 is_owned_tree() {
-	[ -d "$1" ] && [ "$(plist_owner "$1")" = "$2" ]
+	[ ! -L "$1" ] && [ -d "$1" ] && [ "$(plist_owner "$1")" = "$2" ]
 }
 
 is_owned_link() {
@@ -204,12 +208,34 @@ case "$NOTARIZE" in 0|1) ;; *) print -u2 -- "NCPIN_NOTARIZE muss 0 oder 1 sein";
 # In /Applications liegen ausschliesslich Bundles mit angeheftetem
 # Notary-Ticket. Ein ad-hoc oder nur signierter Build darf dort nie landen —
 # lieber gar nicht installieren als unnotarisiert.
+PROTECTED_APPS="/Applications"
+
+dir_identity() {  # $1 = Pfad -> "geraetenummer:inode" oder leer
+	/usr/bin/stat -f '%d:%i' "$1" 2>/dev/null || true
+}
+
 is_protected_dir() {  # $1 = zu pruefendes Verzeichnis
 	# :A macht den Pfad absolut und loest Symlinks auf, damit weder ein
 	# relatives Ziel noch ein Umweg ueber einen Symlink die Regel umgeht.
 	case "${1:A}" in
 		/Applications|/Applications/*) return 0 ;;
 	esac
+	# Der Name allein genuegt nicht: /Applications und
+	# /System/Volumes/Data/Applications sind auf macOS ueber einen Firmlink
+	# DASSELBE Verzeichnis (gleiche Geraete- und Inode-Nummer), und :A loest
+	# einen Firmlink nicht auf. Deshalb zusaetzlich die Identitaet vergleichen,
+	# und zwar fuer das Ziel selbst und jeden vorhandenen Vorfahren — sonst
+	# rutschte ein Unterordner unter dem zweiten Namen durch.
+	local protected probe parent
+	protected="$(dir_identity "$PROTECTED_APPS")"
+	[ -n "$protected" ] || return 1
+	probe="${1:A}"
+	while [ -n "$probe" ] && [ "$probe" != "/" ]; do
+		if [ "$(dir_identity "$probe")" = "$protected" ]; then return 0; fi
+		parent="${probe:h}"
+		if [ "$parent" = "$probe" ]; then break; fi
+		probe="$parent"
+	done
 	return 1
 }
 
@@ -228,6 +254,24 @@ if [ "$STAGE_ONLY" -eq 1 ] && is_protected_dir "$STAGE_DIR"; then
 	print -u2 -- "  ./build.sh                          # baut nach build/ im Projektordner"
 	print -u2 -- "  ./install.sh                        # installiert notarisiert nach $APPS"
 	exit 2
+fi
+
+# Das Notary-Gate haengt allein an $APPS. Ohne diese Pruefung fuehren
+# NCPIN_SERVICES_DIR und NCPIN_LINK_DIR daran vorbei: Ein Quick-Action-Bundle
+# und der CLI-Symlink sind keine notarisierten App-Bundles und haben in
+# /Applications deshalb nichts verloren — egal ueber welchen der beiden
+# macOS-Namen dieses Verzeichnis angesprochen wird.
+if [ "$STAGE_ONLY" -eq 0 ]; then
+	for ziel in "$SVC" "$LINKDIR"; do
+		if is_protected_dir "$ziel"; then
+			print -u2 -- "FEHLER: $ziel liegt in $PROTECTED_APPS."
+			print -u2 -- "Dort liegen ausschliesslich notarisierte App-Bundles;"
+			print -u2 -- "Quick Actions und der CLI-Symlink gehoeren woandershin."
+			print -u2 -- "Stattdessen NCPIN_SERVICES_DIR bzw. NCPIN_LINK_DIR auf ein"
+			print -u2 -- "eigenes Verzeichnis setzen (Standard: ~/Library/Services)."
+			exit 2
+		fi
+	done
 fi
 
 # Fail-closed und bewusst VOR der Kollisionspruefung: Wer ohne Zertifikat nach
@@ -406,12 +450,27 @@ remove_stage() {
 # vernichten, obwohl ohne --force nichts Fremdes angefasst werden darf. Also
 # zurücktauschen und abbrechen. Gibt immer 0 zurueck; der Aufrufer meldet den
 # Fehlschlag.
-rollback_foreign_swapout() {  # $1=stage $2=ziel
-	local stage="$1" destination="$2"
+#
+# Nach dem Ruecktausch liegt am Stage-Pfad das, was gerade am Ziel lag — im
+# Normalfall das eigene, frisch gebaute Artefakt. Wurde das Ziel im Fenster ein
+# ZWEITES Mal fremd ersetzt, liegt dort aber ein weiteres fremdes Artefakt.
+# Deshalb wird der Stage-Inhalt vor dem Loeschen geprueft und im Zweifel
+# stehengelassen: Ungeprueften Stage-Inhalt nie loeschen.
+rollback_foreign_swapout() {  # $1=stage $2=ziel $3=besitzer (leer = CLI-Symlink)
+	local stage="$1" destination="$2" owner="${3:-}" stage_is_own=0
 	if /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$destination" "$stage"; then
-		remove_stage "$stage"
+		if [ -n "$owner" ]; then
+			if is_owned_tree "$stage" "$owner"; then stage_is_own=1; fi
+		else
+			if is_owned_link "$stage"; then stage_is_own=1; fi
+		fi
 		print -u2 -- "Kollision: $destination wurde waehrend der Installation ersetzt."
-		print -u2 -- "Das fremde Artefakt wurde zurueckgelegt; nichts installiert."
+		if [ "$stage_is_own" -eq 1 ]; then
+			remove_stage "$stage"
+			print -u2 -- "Das fremde Artefakt wurde zurueckgelegt; dieser Schritt wurde nicht installiert."
+		else
+			print -u2 -- "Das Ziel wurde erneut fremd ersetzt; nicht geloescht: $stage"
+		fi
 	else
 		print -u2 -- "FEHLER: Ruecktausch fehlgeschlagen — fremdes Artefakt liegt unter $stage."
 	fi
@@ -433,7 +492,7 @@ install_tree() {
 	# ncpin-eigen markierter darf hier geloescht werden.
 	if [ "$FORCE" -eq 0 ] && path_exists "$stage" \
 			&& ! is_owned_tree "$stage" "$owner"; then
-		rollback_foreign_swapout "$stage" "$destination"
+		rollback_foreign_swapout "$stage" "$destination" "$owner"
 		return 1
 	fi
 	remove_stage "$stage"

@@ -13,6 +13,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import unicodedata
 import unittest
 from unittest import mock
 
@@ -819,13 +820,97 @@ class RenameTransportTests(unittest.TestCase):
         rc, _out, _err = self.run_cli("local", logical,
                                       race=swap_intermediate_for_symlink)
 
-        self.assertEqual(rc, 1)
+        # ELOOP beim komponentenweisen Oeffnen heisst: Der aufgeloeste Pfad ist
+        # nicht mehr der gepruefte. Das ist laut CLI-Vertrag ein Pfadfehler
+        # (Exit 3) und kein Laufzeitfehler (Exit 1).
+        self.assertEqual(rc, 3)
         # Ausserhalb wurde nichts angefasst; der echte Platzhalter liegt noch da.
         self.assertTrue(os.path.exists(outside_placeholder))
         self.assertFalse(os.path.exists(
             os.path.join(self.outside, "tief", "datei.txt")))
         self.assertTrue(os.path.exists(
             inside_placeholder.replace("/zwischen/", "/zwischen.weg/")))
+
+    def test_open_folder_moved_out_of_root_is_not_renamed_outside(self):
+        # Ein Verzeichnis-fd haengt an der Inode, nicht am Pfad: Wird der schon
+        # geoeffnete Ordner danach aus der Syncwurzel geschoben, wuerden weitere
+        # Renames ausserhalb jeder registrierten Wurzel wirken. Die Pruefung
+        # unmittelbar vor dem Rename muss das mit Exit 3 stoppen.
+        self.make_placeholder("ordner/datei.txt")
+        folder = os.path.join(self.root, "ordner")
+        moved = os.path.join(self.outside, "verschoben")
+        original_open = self.ncpin._open_canonical_dir
+
+        def open_then_move(path):
+            dirfd = original_open(path)
+            if os.path.basename(path) == "ordner":
+                os.rename(folder, moved)
+            return dirfd
+
+        with mock.patch.object(self.ncpin, "_open_canonical_dir",
+                               side_effect=open_then_move):
+            rc, _out, _err = self.run_cli("local", folder)
+
+        self.assertEqual(rc, 3)
+        # Der Platzhalter liegt unveraendert am neuen (fremden) Ort.
+        self.assertTrue(os.path.exists(
+            os.path.join(moved, "datei.txt") + self.ncpin.SUFFIX))
+        self.assertFalse(os.path.exists(os.path.join(moved, "datei.txt")))
+
+    def test_umlaut_folder_in_the_other_unicode_form_still_renames(self):
+        # APFS speichert einen Namen so, wie er angelegt wurde, findet ihn aber
+        # auch in der anderen Unicode-Normalform. Der Kernel meldet den
+        # GESPEICHERTEN Namen (hier NFD), der geprüfte Pfad kommt vom Nutzer
+        # (hier NFC). Die Grenzprüfung vor dem Rename muss deshalb normalisiert
+        # vergleichen — sonst scheitert schon ein deutscher Ordnername.
+        nfd = unicodedata.normalize("NFD", "Büro")
+        nfc = unicodedata.normalize("NFC", "Büro")
+        os.makedirs(os.path.join(self.root, nfd))
+        self.make_placeholder(os.path.join(nfd, "datei.txt"))
+        folder = os.path.join(self.root, nfc)
+
+        rc, _out, err = self.run_cli("local", folder)
+
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.root, nfd, "datei.txt")))
+
+    def test_folder_state_ignores_symlink_to_a_file_outside_the_root(self):
+        # Der Aktionspfad ueberspringt Symlinks; der Zustandsleser muss das auch
+        # tun. Sonst leitet toggle seine Richtung aus einer fremden Datei
+        # AUSSERHALB der Syncwurzel ab und meldet danach Exit 0, ohne einen
+        # einzigen bearbeitbaren Eintrag umgeschaltet zu haben.
+        foreign = os.path.join(self.outside, "fremd.txt")
+        with open(foreign, "wb") as handle:
+            handle.write(b"xy")          # 2 Byte -> saehe wie "lokal" aus
+        folder = os.path.join(self.root, "nurlink")
+        os.makedirs(folder)
+        os.symlink(foreign, os.path.join(folder, "link.txt"))
+
+        self.assertEqual(self.ncpin.fs_folder_state(folder, exact=True),
+                         "unknown")
+        rc, out, _err = self.run_cli("toggle", "--json", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Zustand nicht ermittelbar", json.loads(out)[0]["error"])
+        self.assertEqual(os.stat(foreign).st_size, 2)
+
+    def test_unreadable_entry_is_not_taken_for_an_already_dehydrated_file(self):
+        # Ein Zugriffsfehler beim Pruefen der Namen darf nie als "existiert
+        # nicht" durchgehen: online haette die Datei sonst fuer bereits
+        # dehydriert gehalten und Exit 0 gemeldet, ohne etwas zu tun.
+        self.make_file("sperr/inhalt.txt", b"voller inhalt")
+        folder = os.path.join(self.root, "sperr")
+
+        os.chmod(folder, 0o400)  # lesbar, aber nicht durchsuchbar -> EACCES
+        try:
+            rc, out, _err = self.run_cli("online", "--json", folder)
+        finally:
+            os.chmod(folder, 0o755)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("übersprungen", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(os.path.join(folder, "inhalt.txt")))
 
     def test_folder_action_reports_failed_rename_instead_of_swallowing_it(self):
         # Ein echter Dateisystemfehler (hier EPERM) ist kein Verschwinde-Rennen.

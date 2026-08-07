@@ -232,6 +232,17 @@ Developer-ID oder mit `NCPIN_NOTARIZE=0` bricht `install.sh` mit Exit 2 ab, bevo
 vor dem Einsetzen mit Exit 1 ab. Ad-hoc-Stände bleiben im Projektordner
 (`./build.sh`) oder gehen in ein ausdrücklich gesetztes `NCPIN_APPS_DIR`.
 
+Die Schranke gilt für **jedes** Schreibziel des Installers, nicht nur für die
+Apps: `NCPIN_SERVICES_DIR` und `NCPIN_LINK_DIR` führen sonst mit Quick Actions
+und CLI-Symlink am Gate vorbei. Und sie hängt an der Verzeichnisidentität, nicht
+am Namen — `/System/Volumes/Data/Applications` ist über einen Firmlink dasselbe
+Verzeichnis wie `/Applications`, und `:A` löst einen Firmlink nicht auf.
+
+Ein Releaseartefakt bekommt seinen kanonischen Namen erst, wenn Signatur,
+Notarisierung, Stapler und Gatekeeper grün sind. Vorher trägt es einen sichtbar
+unfertigen Namen und wird im Fehler-Trap entfernt; sonst hält eine nachgelagerte
+Automatisierung ein abgelehntes Image für ein fertiges Release.
+
 Prüfungen für einen Release:
 
 - `codesign --verify --strict --deep` für beide Apps;

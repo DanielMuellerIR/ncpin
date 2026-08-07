@@ -335,18 +335,60 @@ def _settle_after_failed_transition(runner, sample, initial_state,
     """Beobachtet nach einem fehlgeschlagenen Uebergang kurz nach.
 
     Startet mit der bereits gelesenen Beobachtung und gibt die letzte zurueck
-    (Zustand, Messwerte, On-Disk-Pfad). Bricht ab, sobald Zustand oder Pfad vom
-    Anfang abweichen — dann hat der bereits gesendete Befehl verspaetet
-    gewirkt, und die Wiederherstellung muss ihn aktiv zuruecknehmen.
+    (Zustand, Messwerte, On-Disk-Pfad). Bricht ab, sobald ein BEKANNTER
+    Gegenzustand oder ein geaenderter On-Disk-Pfad sichtbar wird — dann hat der
+    bereits gesendete Befehl verspaetet gewirkt, und die Wiederherstellung muss
+    ihn aktiv zuruecknehmen.
+
+    ``unknown`` gilt dabei ausdruecklich NICHT als beobachteter Uebergang:
+    read_status_state() liefert das schon bei einem einzelnen Status-, Exit-Code-
+    oder JSON-Fehler. Wer darauf abbricht, verweigert die Wiederherstellung
+    (siehe roundtrip), obwohl der naechste Poll wieder einen sicheren Zustand
+    liefern kann und der urspruengliche Befehl weiterhin spaet wirken darf.
     """
     for _ in range(SETTLE_POLLS):
-        if state != initial_state or (initial_ondisk is not None
-                                      and ondisk != initial_ondisk):
+        if state in ("local", "online") and state != initial_state:
+            break
+        if initial_ondisk is not None and ondisk != initial_ondisk:
             break
         time.sleep(SETTLE_PAUSE)
         state, probe = read_status_state(runner, sample)
         ondisk = _ondisk_representation(sample)
     return state, probe, ondisk
+
+
+def _reassert_initial_state(runner, sample, timeout, initial_state,
+                            initial_ondisk, result):
+    """Beauftragt den Anfangszustand aktiv erneut und prueft ihn danach nach.
+
+    Sieht der Zustand nach einem fehlgeschlagenen Uebergang unveraendert aus,
+    heisst das nicht, dass nichts mehr passiert: MAKE-Befehle und
+    Rename-Wuensche sind fire-and-forget, der Client kann sie auch nach dem
+    Nachbeobachtungsfenster noch ausfuehren (AGENTS: "Ein Timeout beweist bei
+    fire-and-forget nichts"). Der erneute Auftrag ist im Normalfall ein
+    wirkungsloser No-op und im Ernstfall die Gegenweisung, die den ausstehenden
+    Befehl ueberholt. Erst der danach gelesene Zustand samt Pfad darf als
+    "wiederhergestellt" gelten.
+    """
+    dt, rc, out, err = run_ncpin(
+        runner, [initial_state, sample, "--wait", "--timeout", str(timeout)])
+    final_state, final_probe = read_status_state(runner, sample)
+    final_ondisk = _ondisk_representation(sample)
+    restored = (rc == 0 and final_state == initial_state
+                and (initial_ondisk is None or final_ondisk == initial_ondisk))
+    result["steps"].append({
+        "target": initial_state,
+        "elapsed_ms": round(dt * 1000, 1),
+        "reached": restored,
+        "rc": rc,
+        "stdout": out.strip(),
+        "stderr": err.strip(),
+        "observed_state": final_state,
+        "restoration": True,
+    })
+    result["final_probe"] = final_probe
+    result["final_ondisk"] = final_ondisk
+    return restored
 
 
 def _revert_pending_transition(runner, sample, timeout, initial_state,
@@ -445,7 +487,13 @@ def roundtrip(runner, sample, timeout):
         path_stable = (initial_ondisk is None
                        or current_ondisk == initial_ondisk)
         if current_state == initial_state and path_stable:
-            result["restore_verified"] = True
+            # Zustand und Pfad sehen aus wie am Anfang. Das allein ist bei
+            # fire-and-forget kein Beweis: Der gesendete Befehl kann auch nach
+            # dem Nachbeobachtungsfenster noch wirken. Also den Anfangszustand
+            # aktiv erneut beauftragen und das Ergebnis pollen, statt ihn nur
+            # zu erwarten.
+            result["restore_verified"] = _reassert_initial_state(
+                runner, sample, timeout, initial_state, initial_ondisk, result)
         elif (initial_ondisk is not None and current_ondisk is not None
                 and current_ondisk != initial_ondisk):
             # Der Pfadname weicht ab -> ein Rename-Uebergang steht noch aus,

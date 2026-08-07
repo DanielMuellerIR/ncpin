@@ -129,6 +129,30 @@ class InstallerTest(unittest.TestCase):
         os.chmod(target, 0o755)
         return target
 
+    def shell_function(self, name):
+        """Schneidet eine zsh-Funktion aus install.sh heraus.
+
+        So laesst sich eine reine Prueffunktion isoliert ausfuehren, ohne den
+        Installer laufen zu lassen — sie schreibt dann garantiert nirgendwohin.
+        """
+        with open(os.path.join(self.copy, "install.sh"), encoding="utf-8") as fh:
+            lines = fh.read().splitlines(True)
+        start = next(index for index, line in enumerate(lines)
+                     if line.startswith(name + "() {"))
+        end = next(index for index in range(start, len(lines))
+                   if lines[index] == "}\n")
+        return "".join(lines[start:end + 1])
+
+    def ask_is_protected_dir(self, candidate):
+        """Fragt is_protected_dir isoliert; Rueckgabe ist der Exit-Code."""
+        script = ('PROTECTED_APPS="/Applications"\n'
+                  + self.shell_function("dir_identity")
+                  + self.shell_function("is_protected_dir")
+                  + 'is_protected_dir "$1"\n')
+        return subprocess.run(["/bin/zsh", "-c", script, "zsh", candidate],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True).returncode
+
     def run_patched_installer(self, env, *arguments):
         return subprocess.run(
             ["/bin/zsh", self.patched_installer()] + list(arguments),
@@ -453,6 +477,61 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("--stage-only darf nicht", result.stderr)
         self.assert_old_app_preserved()
 
+    def test_protected_dir_covers_both_macos_names_of_applications(self):
+        # /Applications und /System/Volumes/Data/Applications sind auf macOS
+        # ueber einen Firmlink DASSELBE Verzeichnis; :A loest das nicht auf.
+        # Die Prueffunktion laeuft hier isoliert — sie schreibt nichts und
+        # beantwortet nur die Frage "geschuetzt?".
+        firmlink = "/System/Volumes/Data/Applications"
+        if not os.path.isdir(firmlink):
+            self.skipTest("kein zweiter /Applications-Name auf diesem Mac")
+
+        self.assertEqual(self.ask_is_protected_dir("/Applications"), 0)
+        self.assertEqual(self.ask_is_protected_dir(firmlink), 0)
+        self.assertEqual(
+            self.ask_is_protected_dir(os.path.join(firmlink, "Beliebig.app")), 0)
+        # Gegenprobe: ein gewoehnliches Ziel bleibt ungeschuetzt.
+        self.assertEqual(self.ask_is_protected_dir(self.apps), 1)
+
+    def test_services_and_link_dir_are_refused_inside_the_protected_dir(self):
+        # Das Notary-Gate haengt an NCPIN_APPS_DIR. Ueber NCPIN_SERVICES_DIR und
+        # NCPIN_LINK_DIR liessen sich sonst unnotarisierte .workflow-Bundles und
+        # ein CLI-Symlink am Gate vorbei ins geschuetzte Verzeichnis schreiben.
+        # Im gepatchten Installer ist das Testziel das geschuetzte Verzeichnis.
+        andere_apps = os.path.join(self.root, "targets", "andere-apps")
+        os.makedirs(andere_apps)
+        for variable in ("NCPIN_SERVICES_DIR", "NCPIN_LINK_DIR"):
+            with self.subTest(variable=variable):
+                env = self.env.copy()
+                env["NCPIN_APPS_DIR"] = andere_apps
+                env[variable] = self.apps
+
+                result = self.run_patched_installer(env)
+
+                self.assertEqual(result.returncode, 2,
+                                 result.stderr + result.stdout)
+                self.assertIn("liegt in /Applications", result.stderr)
+                # Nichts gebaut, nichts geschrieben.
+                self.assertEqual(os.listdir(self.apps), [])
+                self.assertEqual(os.listdir(andere_apps), [])
+
+    def test_uninstall_keeps_a_foreign_symlink_to_an_owned_bundle(self):
+        # plist_owner() folgt einem Verzeichnis-Symlink bis zum Besitzmarker des
+        # Zielbundles. Ein fremder Symlink auf ein markiertes ncpin-Bundle darf
+        # dadurch nicht als eigener Baum gelten und ohne --force verschwinden.
+        self.install_ok()
+        verlagert = os.path.join(self.root, "verlagert.app")
+        shutil.move(self.app(), verlagert)
+        os.symlink(verlagert, self.app())
+
+        result = self.run_installer("--uninstall")
+
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertTrue(os.path.islink(self.app()))
+        self.assertIn("nicht als ncpin-eigen markiert", result.stderr)
+        # Das Bundle hinter dem Symlink blieb ebenfalls unangetastet.
+        self.assertTrue(os.path.isdir(verlagert))
+
     def test_relative_apps_dir_becomes_absolute_in_the_quick_actions(self):
         # NCPIN_APPS_DIR darf relativ gesetzt werden. In der Quick Action muss
         # aber ein absoluter Pfad landen: Automator loest ihn spaeter gegen ein
@@ -528,6 +607,47 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(
             [name for name in os.listdir(self.apps)
              if name.startswith(".ncpin-stage")], [])
+
+    def test_second_foreign_replacement_survives_the_rollback(self):
+        # Zweiter Zielwechsel im selben Fenster: Waehrend des Ruecktauschs wird
+        # das Ziel NOCHMALS fremd ersetzt. Danach liegt am Stage-Pfad nicht das
+        # eigene Artefakt, sondern das dritte fremde — es darf nicht geloescht
+        # werden, sonst vernichtet ausgerechnet der Schutzweg fremdes Material.
+        self.install_ok()
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        # Der Shim ersetzt beim Einsetzen das Ziel (erster Wechsel) und beim
+        # Ruecktausch erneut (zweiter Wechsel) und ruft danach jeweils die echte
+        # Implementierung aus dem Repo auf.
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, shutil, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1], sys.argv[2]\n"
+                "def fremd(pfad, marke):\n"
+                "    shutil.rmtree(pfad)\n"
+                "    os.makedirs(pfad)\n"
+                "    open(os.path.join(pfad, marke), 'w').close()\n"
+                "if os.path.basename(destination) == 'Lokal halten.app':\n"
+                "    fremd(destination, 'foreign-eins')\n"
+                "elif os.path.basename(source) == 'Lokal halten.app':\n"
+                "    fremd(source, 'foreign-zwei')\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                % os.path.join(REPO, "tools"))
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("erneut fremd ersetzt", result.stderr)
+        # Am Ziel liegt wieder das erste fremde Artefakt …
+        self.assertTrue(os.path.exists(
+            os.path.join(self.app(), "foreign-eins")))
+        # … und das zweite blieb unversehrt am Stage-Pfad liegen.
+        stages = [name for name in os.listdir(self.apps)
+                  if name.startswith(".ncpin-stage")]
+        self.assertEqual(len(stages), 1, stages)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.apps, stages[0], "foreign-zwei")))
 
     def test_stage_only_and_uninstall_are_mutually_exclusive(self):
         # "Nur bauen" darf niemals nebenbei deinstallieren: die Kombination

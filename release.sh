@@ -75,6 +75,12 @@ VOLNAME="ncpin"
 DIST="build/dmg"
 DMG="$DIST/ncpin.dmg"
 RW_DMG="$DIST/ncpin-rw.dmg"
+# Zwischenstand mit sprechendem Namen: Signieren, Notarisieren, Stapeln und die
+# Gatekeeper-Probe laufen auf DIESER Datei. Erst wenn alles gruen ist, wird sie
+# auf den kanonischen Namen umbenannt. Sonst laege nach einem spaeten Fehler ein
+# unsigniertes oder abgelehntes Image am regulaeren Releasepfad, und eine
+# nachgelagerte Automatisierung hielte es fuer ein fertiges Release.
+PARTIAL_DMG="$DIST/ncpin-unfertig.dmg"
 MOUNT_DIR="/Volumes/$VOLNAME"
 # Geraeteknoten (/dev/diskN[sM]) des EIGENEN hdiutil attach. Nur dieses Geraet
 # wird je getrennt — niemals blind der Mountpoint: Dort koennte ein fremdes
@@ -88,7 +94,7 @@ cleanup() {
 			|| hdiutil detach "$ATTACHED_DEV" -force >/dev/null 2>&1 || true
 		ATTACHED_DEV=""
 	fi
-	rm -f -- "$RW_DMG"
+	rm -f -- "$RW_DMG" "$PARTIAL_DMG"
 }
 trap cleanup EXIT
 
@@ -102,7 +108,7 @@ done
 
 echo "=== 2/3 DMG packen ==="
 mkdir -p -- "$DIST"
-rm -f -- "$DMG" "$RW_DMG"
+rm -f -- "$DMG" "$RW_DMG" "$PARTIAL_DMG"
 # Fail-closed statt detach -force: Haengt unter dem Mountpoint bereits ein
 # (moeglicherweise fremdes) Volume, wird es NICHT zwangsgetrennt — abbrechen
 # und dem Nutzer das Auswerfen ueberlassen. mount(8) zeigt aufgeloeste Pfade,
@@ -195,7 +201,7 @@ sync; sleep 2                       # Race: DS_Store-Schreibpuffer vs. detach
 hdiutil detach "$ATTACHED_DEV" || { sleep 2; hdiutil detach "$ATTACHED_DEV" -force; }
 ATTACHED_DEV=""
 
-hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -o "$DMG"
+hdiutil convert "$RW_DMG" -format UDZO -imagekey zlib-level=9 -o "$PARTIAL_DMG"
 rm -f -- "$RW_DMG"
 
 echo "=== 3/3 DMG signieren, notarisieren, stapeln ==="
@@ -208,10 +214,14 @@ if [ -z "$SIGN_ID" ]; then
 	print -u2 -- "FEHLER: Kein Developer-ID-Zertifikat — ein unsigniertes DMG hat keinen Zweck."
 	exit 1
 fi
-codesign --force --timestamp --sign "$SIGN_ID" "$DMG"
-xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
-xcrun stapler staple "$DMG"
-xcrun stapler validate "$DMG"
-spctl --assess --type open --context context:primary-signature -v "$DMG" 2>&1 | tail -2
+codesign --force --timestamp --sign "$SIGN_ID" "$PARTIAL_DMG"
+xcrun notarytool submit "$PARTIAL_DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+xcrun stapler staple "$PARTIAL_DMG"
+xcrun stapler validate "$PARTIAL_DMG"
+spctl --assess --type open --context context:primary-signature -v "$PARTIAL_DMG" 2>&1 | tail -2
+
+# Erst jetzt den kanonischen Namen vergeben: Ab hier ist das Image signiert,
+# notarisiert, gestapelt und von Gatekeeper akzeptiert.
+mv -f -- "$PARTIAL_DMG" "$DMG"
 
 echo "RELEASE OK: $PWD/$DMG"
