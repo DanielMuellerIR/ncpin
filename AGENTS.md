@@ -89,6 +89,15 @@ liegen (Socket: `REGISTER_PATH`; Rename: suffix-Ordner der `nextcloud.cfg`).
 Symlinks, `..`, Suffixauflösung und mehrere Wurzeln dürfen diese Grenze nicht
 umgehen. Außerhalb: klarer Fehler, keine Transportaktion.
 
+Die Grenze wird am Dateideskriptor verankert, nicht am Pfadstring: `O_NOFOLLOW`
+schützt nur die unmittelbar geöffnete Komponente. Eine sicherheitskritische
+Rekursion öffnet deshalb jede Komponente relativ zu einem vertrauenswürdigen
+Wurzel-Dateideskriptor (`_open_canonical_dir`) und prüft unmittelbar vor der
+Änderung erneut, dass das Ziel weiterhin unter dieser Wurzel liegt. Sonst genügt
+ein nach der Prüfung eingesetzter Symlink in einem Zwischenverzeichnis, um
+`local` außerhalb der Syncwurzel wirken zu lassen (real aufgetreten). Ein
+einmal geprüfter Pfadstring ist nach der Prüfung wertlos.
+
 Im `suffix`-VFS-Modus liegt ein online-only Platzhalter als
 `<name>.nextcloud`; ownCloud kann einen anderen Suffix verwenden.
 `resolve_ondisk()` akzeptiert logischen und Platzhalterpfad, gibt aber konsistent
@@ -198,6 +207,12 @@ Testumfang nach Änderung:
 ursprünglichen Zustand verändern. Nur auf einem ausdrücklich gewählten,
 entbehrlichen Fixture ausführen und anschließend den vorher gelesenen Zustand
 wiederherstellen. Nie automatisch die erste echte Nutzerdatei verwenden.
+
+Ein Timeout beweist bei fire-and-forget nichts: Bleibt der Zustand während des
+Wartens unverändert, kann der Client den Befehl trotzdem später ausführen und das
+Fixture nachträglich umstellen. Ein mutierender Test darf den Ausgangszustand
+deshalb nicht nur „erwarten", sondern muss ihn aktiv erneut beauftragen und seine
+Wiederherstellung pollen, bevor er als aufgeräumt gilt.
 
 ## Signatur, Notarisierung und TCC
 
