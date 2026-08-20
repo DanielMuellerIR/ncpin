@@ -22,6 +22,7 @@ APPS="${NCPIN_APPS_DIR:-/Applications}"
 # absolut, ohne Symlinks aufzuloesen (das erledigt is_protected_dir separat).
 APPS="${APPS:a}"
 SVC="${NCPIN_SERVICES_DIR:-$HOME/Library/Services}"
+SVC="${SVC:a}"
 LINKDIR_OVERRIDE="${NCPIN_LINK_DIR:-}"
 APP1="$APPS/Lokal halten.app"
 APP2="$APPS/Speicher freigeben.app"
@@ -157,6 +158,7 @@ else
 	done
 	[ -n "$LINKDIR" ] || LINKDIR="$HOME/bin"
 fi
+LINKDIR="${LINKDIR:a}"
 LINK="$LINKDIR/ncpin"
 
 assert_replaceable_tree() {
@@ -218,7 +220,7 @@ is_protected_dir() {  # $1 = zu pruefendes Verzeichnis
 	# :A macht den Pfad absolut und loest Symlinks auf, damit weder ein
 	# relatives Ziel noch ein Umweg ueber einen Symlink die Regel umgeht.
 	case "${1:A}" in
-		/Applications|/Applications/*) return 0 ;;
+		$PROTECTED_APPS|$PROTECTED_APPS/*) return 0 ;;
 	esac
 	# Der Name allein genuegt nicht: /Applications und
 	# /System/Volumes/Data/Applications sind auf macOS ueber einen Firmlink
@@ -228,7 +230,13 @@ is_protected_dir() {  # $1 = zu pruefendes Verzeichnis
 	# rutschte ein Unterordner unter dem zweiten Namen durch.
 	local protected probe parent
 	protected="$(dir_identity "$PROTECTED_APPS")"
-	[ -n "$protected" ] || return 1
+	if [ -z "$protected" ]; then
+		if [ -e "$PROTECTED_APPS" ]; then
+			print -u2 -- "FEHLER: Identitaet von $PROTECTED_APPS konnte nicht ermittelt werden."
+			exit 2
+		fi
+		return 1
+	fi
 	probe="${1:A}"
 	while [ -n "$probe" ] && [ "$probe" != "/" ]; do
 		if [ "$(dir_identity "$probe")" = "$protected" ]; then return 0; fi
@@ -239,6 +247,14 @@ is_protected_dir() {  # $1 = zu pruefendes Verzeichnis
 	return 1
 }
 
+reject_if_protected() {  # $1 = Pfad, $2 = Hinweistext
+	local ziel="$1" hinweis="$2"
+	if is_protected_dir "$ziel"; then
+		print -u2 -- "$hinweis"
+		exit 2
+	fi
+}
+
 target_needs_notary_ticket() {
 	is_protected_dir "$APPS"
 }
@@ -247,13 +263,13 @@ target_needs_notary_ticket() {
 # entfernt am Zielort gleichnamige Artefakte mit rm -rf. Genau deshalb darf es
 # nie ins geschuetzte Verzeichnis schreiben — sonst waere "./build.sh
 # /Applications" ein Weg an beiden Schranken vorbei.
-if [ "$STAGE_ONLY" -eq 1 ] && is_protected_dir "$STAGE_DIR"; then
-	print -u2 -- "FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen."
-	print -u2 -- "Dort liegen ausschliesslich installierte, notarisierte Bundles."
-	print -u2 -- "Stattdessen:"
-	print -u2 -- "  ./build.sh                          # baut nach build/ im Projektordner"
-	print -u2 -- "  ./install.sh                        # installiert notarisiert nach $APPS"
-	exit 2
+if [ "$STAGE_ONLY" -eq 1 ]; then
+	reject_if_protected "$STAGE_DIR" \
+"FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen.
+Dort liegen ausschliesslich installierte, notarisierte Bundles.
+Stattdessen:
+  ./build.sh                          # baut nach build/ im Projektordner
+  ./install.sh                        # installiert notarisiert nach $APPS"
 fi
 
 # Das Notary-Gate haengt allein an $APPS. Ohne diese Pruefung fuehren
@@ -263,14 +279,12 @@ fi
 # macOS-Namen dieses Verzeichnis angesprochen wird.
 if [ "$STAGE_ONLY" -eq 0 ]; then
 	for ziel in "$SVC" "$LINKDIR"; do
-		if is_protected_dir "$ziel"; then
-			print -u2 -- "FEHLER: $ziel liegt in $PROTECTED_APPS."
-			print -u2 -- "Dort liegen ausschliesslich notarisierte App-Bundles;"
-			print -u2 -- "Quick Actions und der CLI-Symlink gehoeren woandershin."
-			print -u2 -- "Stattdessen NCPIN_SERVICES_DIR bzw. NCPIN_LINK_DIR auf ein"
-			print -u2 -- "eigenes Verzeichnis setzen (Standard: ~/Library/Services)."
-			exit 2
-		fi
+		reject_if_protected "$ziel" \
+"FEHLER: $ziel liegt in /Applications ($PROTECTED_APPS).
+Dort liegen ausschliesslich notarisierte App-Bundles;
+Quick Actions und der CLI-Symlink gehoeren woandershin.
+Stattdessen NCPIN_SERVICES_DIR bzw. NCPIN_LINK_DIR auf ein
+eigenes Verzeichnis setzen (Standard: ~/Library/Services)."
 	done
 fi
 
@@ -414,6 +428,9 @@ is_owned_tree "$BUILT_QA2" "$QA_BASE.online" || { print -u2 -- "Besitzmarker feh
 # irgendetwas zu installieren. Bewusst NACH den Besitzmarker-Pruefungen, damit
 # auch der Staging-Weg nur geprueftes Material weitergibt.
 if [ "$STAGE_ONLY" -eq 1 ]; then
+	reject_if_protected "$STAGE_DIR" \
+"FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen.
+Dort liegen ausschliesslich installierte, notarisierte Bundles."
 	mkdir -p -- "$STAGE_DIR"
 	for artefakt in "$BUILT_APP1" "$BUILT_APP2" "$BUILT_QA1" "$BUILT_QA2"; do
 		rm -rf -- "$STAGE_DIR/${artefakt:t}"
@@ -436,6 +453,13 @@ if target_needs_notary_ticket; then
 		fi
 	done
 fi
+
+for ziel in "$SVC" "$LINKDIR"; do
+	reject_if_protected "$ziel" \
+"FEHLER: $ziel liegt in /Applications ($PROTECTED_APPS).
+Dort liegen ausschliesslich notarisierte App-Bundles;
+Quick Actions und der CLI-Symlink gehoeren woandershin."
+done
 
 mkdir -p "$APPS" "$SVC" "$LINKDIR"
 
@@ -503,7 +527,10 @@ install_link() {
 	assert_replaceable_link "$destination"
 	parent="$(dirname "$destination")"
 	stage="$parent/.ncpin-stage-link-$$-$RANDOM"
-	[ ! -e "$stage" ] && [ ! -L "$stage" ]
+	if path_exists "$stage"; then
+		print -u2 -- "FEHLER: Stage-Pfad existiert bereits: $stage"
+		return 1
+	fi
 	ln -s "$NCPIN" "$stage"
 	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
 		remove_stage "$stage"

@@ -81,6 +81,8 @@ RW_DMG="$DIST/ncpin-rw.dmg"
 # unsigniertes oder abgelehntes Image am regulaeren Releasepfad, und eine
 # nachgelagerte Automatisierung hielte es fuer ein fertiges Release.
 PARTIAL_DMG="$DIST/ncpin-unfertig.dmg"
+mkdir -p -- "$DIST"
+rm -f -- "$DMG" "$RW_DMG" "$PARTIAL_DMG"
 MOUNT_DIR="/Volumes/$VOLNAME"
 # Geraeteknoten (/dev/diskN[sM]) des EIGENEN hdiutil attach. Nur dieses Geraet
 # wird je getrennt — niemals blind der Mountpoint: Dort koennte ein fremdes
@@ -94,7 +96,10 @@ cleanup() {
 			|| hdiutil detach "$ATTACHED_DEV" -force >/dev/null 2>&1 || true
 		ATTACHED_DEV=""
 	fi
-	rm -f -- "$RW_DMG" "$PARTIAL_DMG"
+	rm -f -- "$RW_DMG"
+	if [ -n "$PARTIAL_DMG" ]; then
+		rm -f -- "$PARTIAL_DMG"
+	fi
 }
 trap cleanup EXIT
 
@@ -108,7 +113,7 @@ done
 
 echo "=== 2/3 DMG packen ==="
 mkdir -p -- "$DIST"
-rm -f -- "$DMG" "$RW_DMG" "$PARTIAL_DMG"
+rm -f -- "$RW_DMG" "$PARTIAL_DMG"
 # Fail-closed statt detach -force: Haengt unter dem Mountpoint bereits ein
 # (moeglicherweise fremdes) Volume, wird es NICHT zwangsgetrennt — abbrechen
 # und dem Nutzer das Auswerfen ueberlassen. mount(8) zeigt aufgeloeste Pfade,
@@ -222,6 +227,11 @@ spctl --assess --type open --context context:primary-signature -v "$PARTIAL_DMG"
 
 # Erst jetzt den kanonischen Namen vergeben: Ab hier ist das Image signiert,
 # notarisiert, gestapelt und von Gatekeeper akzeptiert.
-mv -f -- "$PARTIAL_DMG" "$DMG"
+FINAL_SRC="$PARTIAL_DMG"
+PARTIAL_DMG=""
+if ! mv -f -- "$FINAL_SRC" "$DMG"; then
+	print -u2 -- "FEHLER: Verschieben nach $DMG fehlgeschlagen. Fertiges Releaseartefakt liegt unter: $FINAL_SRC"
+	exit 1
+fi
 
 echo "RELEASE OK: $PWD/$DMG"

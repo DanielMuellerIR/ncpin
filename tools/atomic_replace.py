@@ -32,6 +32,7 @@ def _renamex(source, destination, flags):
 
 
 def atomic_replace(source, destination):
+    """Ersetzt ziel durch quelle (per RENAME_SWAP wenn vorhanden, sonst RENAME_EXCL)."""
     if os.path.dirname(source) != os.path.dirname(destination):
         raise ValueError("Quelle und Ziel muessen im selben Verzeichnis liegen")
     if not os.path.lexists(source):
@@ -40,10 +41,9 @@ def atomic_replace(source, destination):
         # Exklusiv statt os.rename: ein spaet aufgetauchtes fremdes Ziel
         # darf nicht verloren gehen (EEXIST -> Abbruch, Installer meldet).
         _renamex(source, destination, RENAME_EXCL)
-        return False
+        return
 
     _renamex(source, destination, RENAME_SWAP)
-    return True
 
 
 def main(argv):

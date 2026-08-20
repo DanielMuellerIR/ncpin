@@ -3,6 +3,7 @@
 """Deterministische Tests fuer Protokoll, Pfadschutz und CLI von ncpin."""
 
 import contextlib
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -874,6 +875,63 @@ class RenameTransportTests(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertTrue(os.path.exists(
             os.path.join(self.root, nfd, "datei.txt")))
+
+    def test_case_variant_folder_under_root_still_renames(self):
+        # Auf APFS (case-insensitive) kann eine Pfadkomponente anders geschrieben
+        # sein als auf der Platte (z.B. Buero vs BUERO). Die Grenzpruefung
+        # muss pruefen, dass der aktuelle Pfad in der Wurzel liegt, statt
+        # Zeichenkettengleichheit mit checked_path() zu erzwingen.
+        os.makedirs(os.path.join(self.root, "Buero"))
+        self.make_placeholder(os.path.join("Buero", "datei.txt"))
+        folder_variant = os.path.join(self.root, "BUERO")
+
+        rc, _out, err = self.run_cli("local", folder_variant)
+
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.root, "Buero", "datei.txt")))
+
+    def test_deep_folder_path_beyond_maxpathlen_fails_closed_with_path_error(self):
+        # Wenn _fd_path() mit ENOSPC scheitert (z.B. Pfad laenger als MAXPATHLEN),
+        # muss _assert_dir_unmoved fail-closed mit PathOutsideRoots (Exit 3) reagieren,
+        # statt einen ungeschuetzten Laufzeitfehler (Exit 1) zu werfen.
+        self.make_placeholder("ordner/datei.txt")
+        folder = os.path.join(self.root, "ordner")
+
+        def fake_fd_path(dirfd):
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(self.ncpin, "_fd_path", side_effect=fake_fd_path):
+            rc, _out, _err = self.run_cli("local", folder)
+
+        self.assertEqual(rc, 3)
+
+    def test_folder_with_no_regular_files_reports_error(self):
+        # Ein Ordner ohne regulaere Dateien darf von rename_do_action nicht
+        # als Erfolg gewertet werden, da fs_folder_state "unknown" meldet und
+        # ein nachfolgendes --wait sonst in den vollen Timeout laufen wuerde.
+        foreign = os.path.join(self.outside, "fremd.txt")
+        with open(foreign, "wb") as handle:
+            handle.write(b"xy")
+        folder = os.path.join(self.root, "nurlink")
+        os.makedirs(folder)
+        os.symlink(foreign, os.path.join(folder, "link.txt"))
+
+        rc, out, _err = self.run_cli("local", "--json", folder)
+        self.assertEqual(rc, 1)
+        self.assertIn("keine regulären Dateien", json.loads(out)[0]["error"])
+
+    def test_folder_scan_cap_bounds_non_regular_entries(self):
+        # FOLDER_SCAN_CAP muss alle Eintraege begrenzen, nicht nur regulaere Dateien.
+        folder = os.path.join(self.root, "viele_links")
+        os.makedirs(folder)
+        for i in range(self.ncpin.FOLDER_SCAN_CAP + 20):
+            os.symlink("/nonexistent", os.path.join(folder, "link_%d" % i))
+
+        with mock.patch("os.lstat", wraps=os.lstat) as lstat_spy:
+            state = self.ncpin.fs_folder_state(folder, exact=False)
+            self.assertEqual(state, "unknown")
+            self.assertLessEqual(lstat_spy.call_count, self.ncpin.FOLDER_SCAN_CAP)
 
     def test_folder_state_ignores_symlink_to_a_file_outside_the_root(self):
         # Der Aktionspfad ueberspringt Symlinks; der Zustandsleser muss das auch

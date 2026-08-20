@@ -109,20 +109,20 @@ class InstallerTest(unittest.TestCase):
         """Kopie von install.sh, deren geschuetztes Ziel das Testverzeichnis ist.
 
         Die Regel "nur notarisierte Bundles" haengt an der Konstanten
-        /Applications. Ein Test darf dort niemals hinschreiben, auch nicht
-        versehentlich bei kaputtem Gate. Deshalb wird genau dieses eine
-        case-Muster auf das temporaere Zielverzeichnis umgebogen; der gepruefte
+        PROTECTED_APPS. Ein Test darf dort niemals hinschreiben, auch nicht
+        versehentlich bei kaputtem Gate. Deshalb wird genau diese Zuweisung
+        auf das temporaere Zielverzeichnis umgebogen; der gepruefte
         Code drumherum bleibt der echte. Schlaegt die Ersetzung fehl, faellt der
         Test auf — der Gate-Code kann also nicht unbemerkt verschwinden.
         """
         original = os.path.join(self.copy, "install.sh")
         with open(original, encoding="utf-8") as handle:
             text = handle.read()
-        needle = "\t\t/Applications|/Applications/*) return 0 ;;\n"
+        needle = 'PROTECTED_APPS="/Applications"\n'
         self.assertIn(needle, text)
         protected = os.path.realpath(self.apps)
         patched = text.replace(
-            needle, "\t\t%s|%s/*) return 0 ;;\n" % (protected, protected))
+            needle, 'PROTECTED_APPS="%s"\n' % protected)
         target = os.path.join(self.copy, "install-testziel.sh")
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(patched)
@@ -137,15 +137,24 @@ class InstallerTest(unittest.TestCase):
         """
         with open(os.path.join(self.copy, "install.sh"), encoding="utf-8") as fh:
             lines = fh.read().splitlines(True)
-        start = next(index for index, line in enumerate(lines)
-                     if line.startswith(name + "() {"))
-        end = next(index for index in range(start, len(lines))
-                   if lines[index] == "}\n")
+        start = next((index for index, line in enumerate(lines)
+                      if line.startswith(name + "() {")), None)
+        self.assertIsNotNone(start, "Funktion %s in install.sh nicht gefunden" % name)
+        end = next((index for index in range(start, len(lines))
+                    if lines[index] == "}\n"), None)
+        self.assertIsNotNone(end, "Funktionsende fuer %s in install.sh nicht gefunden" % name)
         return "".join(lines[start:end + 1])
+
+    def shell_assignment(self, varname):
+        with open(os.path.join(self.copy, "install.sh"), encoding="utf-8") as fh:
+            lines = fh.read().splitlines(True)
+        line = next((l for l in lines if l.startswith(varname + "=")), None)
+        self.assertIsNotNone(line, "Zuweisung %s in install.sh nicht gefunden" % varname)
+        return line
 
     def ask_is_protected_dir(self, candidate):
         """Fragt is_protected_dir isoliert; Rueckgabe ist der Exit-Code."""
-        script = ('PROTECTED_APPS="/Applications"\n'
+        script = (self.shell_assignment("PROTECTED_APPS")
                   + self.shell_function("dir_identity")
                   + self.shell_function("is_protected_dir")
                   + 'is_protected_dir "$1"\n')
@@ -648,6 +657,62 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(len(stages), 1, stages)
         self.assertTrue(os.path.exists(
             os.path.join(self.apps, stages[0], "foreign-zwei")))
+
+    def test_symlink_collision_during_install_is_rolled_back(self):
+        self.install_ok()
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, shutil, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1], sys.argv[2]\n"
+                "if os.path.basename(destination) == 'ncpin':\n"
+                "    if os.path.islink(destination) or os.path.exists(destination):\n"
+                "        os.unlink(destination)\n"
+                "    os.symlink('/bin/sh', destination)\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                % os.path.join(REPO, "tools"))
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Kollision", result.stderr)
+        self.assertEqual(os.readlink(os.path.join(self.links, "ncpin")), "/bin/sh")
+        # Kein liegengebliebenes Stage-Link im Link-Ordner
+        self.assertEqual(
+            [name for name in os.listdir(self.links)
+             if name.startswith(".ncpin-stage-link")], [])
+
+    def test_second_foreign_symlink_replacement_survives_the_rollback(self):
+        self.install_ok()
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, shutil, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1], sys.argv[2]\n"
+                "def fremd_link(pfad, ziel):\n"
+                "    if os.path.islink(pfad) or os.path.exists(pfad):\n"
+                "        os.unlink(pfad)\n"
+                "    os.symlink(ziel, pfad)\n"
+                "if os.path.basename(destination) == 'ncpin':\n"
+                "    fremd_link(destination, '/bin/sh')\n"
+                "elif os.path.basename(source) == 'ncpin':\n"
+                "    fremd_link(source, '/bin/zsh')\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                % os.path.join(REPO, "tools"))
+
+        result = self.run_installer()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("erneut fremd ersetzt", result.stderr)
+        self.assertEqual(os.readlink(os.path.join(self.links, "ncpin")), "/bin/sh")
+        stages = [name for name in os.listdir(self.links)
+                  if name.startswith(".ncpin-stage-link")]
+        self.assertEqual(len(stages), 1, stages)
+        self.assertEqual(os.readlink(os.path.join(self.links, stages[0])), "/bin/zsh")
 
     def test_stage_only_and_uninstall_are_mutually_exclusive(self):
         # "Nur bauen" darf niemals nebenbei deinstallieren: die Kombination

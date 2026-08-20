@@ -46,6 +46,8 @@ Headless/AI-Agent (maschinenlesbar):
 """
 
 import argparse
+import errno
+import fcntl
 import glob
 import json
 import os
@@ -53,8 +55,10 @@ import plistlib
 import re
 import socket
 import stat
+import subprocess
 import sys
 import time
+import unicodedata
 
 # Standard-Suffix der virtuellen Platzhalter. Nextcloud-Branding = ".nextcloud",
 # ownCloud = ".owncloud". Per Umgebungsvariable überschreibbar.
@@ -521,14 +525,14 @@ def client_process_running():
     return False
 
 
-def _state_from_size(ondisk, size):
+def _state_from_size(name, size):
     """Zustand aus Dateiname und Größe — gemeinsame Regel für Datei und Ordner.
 
     Getrennt von fs_file_state(), damit der Ordnerscan dieselbe Regel auf ein
     bereits gelesenes lstat-Ergebnis anwenden kann, ohne ein zweites Mal zu
     staten (und ohne dabei einem Symlink zu folgen).
     """
-    if ondisk.endswith(SUFFIX):
+    if name.endswith(SUFFIX):
         # Der Vertrag verlangt EXAKT 1 Byte. Ein Platzhalter mit Vollinhalt
         # (>1 Byte) wäre ein ignorierter Dehydrierungswunsch, eine leere Datei
         # (0 Byte) Datenmüll -> beides ehrlich "unknown".
@@ -549,7 +553,7 @@ def fs_file_state(ondisk):
         size = os.stat(ondisk).st_size
     except OSError:
         return "unknown"
-    return _state_from_size(ondisk, size)
+    return _state_from_size(os.path.basename(ondisk), size)
 
 
 def fs_folder_state(folder, exact=False):
@@ -570,12 +574,10 @@ def fs_folder_state(folder, exact=False):
     nicht lesbaren Unterordner sonst STILL, und ein Baum mit unsichtbarem
     Platzhalter darunter käme fälschlich als einheitlich "local" heraus.
 
-    Gewertet werden nur reguläre Dateien, per lstat und damit ohne einem
-    Symlink zu folgen. Der Aktionspfad (_rename_pin_tree) überspringt Symlinks
-    und Sonderdateien ebenfalls; zählten sie hier mit, könnte ein Symlink auf
-    eine fremde Datei den Ordnerzustand aus Daten AUSSERHALB der Syncwurzel
-    ableiten — toggle liefe danach mit Exit 0 durch, ohne einen einzigen
-    bearbeitbaren Eintrag umzuschalten.
+    Gewertet werden nur sichtbare reguläre Dateien, per lstat und damit ohne einem
+    Symlink zu folgen. Der Aktionspfad (_rename_pin_tree) teilt exakt diese Regel
+    (nur sichtbare reguläre Dateien zählen); beide Stellen müssen zusammenpassen,
+    damit Aktion und Warten dieselbe Aussage treffen.
     """
     seen_local = seen_online = False
     scanned = 0
@@ -588,6 +590,10 @@ def fs_folder_state(folder, exact=False):
         for name in filenames:
             if name.startswith("."):
                 continue
+            if not exact:
+                scanned += 1
+                if scanned > FOLDER_SCAN_CAP:
+                    break
             full = os.path.join(dirpath, name)
             try:
                 st = os.lstat(full)
@@ -597,7 +603,7 @@ def fs_folder_state(folder, exact=False):
             else:
                 if not stat.S_ISREG(st.st_mode):
                     continue  # Symlink/Sonderdatei: zählt nicht zum Zustand
-                state = _state_from_size(full, st.st_size)
+                state = _state_from_size(name, st.st_size)
             if state == "local":
                 seen_local = True
             elif state == "online":
@@ -607,11 +613,7 @@ def fs_folder_state(folder, exact=False):
                 return "unknown"
             if seen_local and seen_online:
                 return "unknown"
-            if not exact:
-                scanned += 1
-                if scanned >= FOLDER_SCAN_CAP:
-                    break
-        if not exact and scanned >= FOLDER_SCAN_CAP:
+        if not exact and scanned > FOLDER_SCAN_CAP:
             break
     if scan_errors:
         # Ein Teilbaum blieb ungelesen -> der Gesamtzustand ist NICHT bekannt.
@@ -867,12 +869,13 @@ def _open_checked_dir(dirpath, roots):
 
     Scheitert das komponentenweise Öffnen mit ENOENT, ENOTDIR oder ELOOP, dann
     ist die Kette zwischen Grenzprüfung und Zugriff verändert worden: Eine
-    Komponente ist verschwunden oder wurde durch einen Symlink ersetzt. Der
-    aufgelöste Pfad ist damit nicht mehr der geprüfte — laut CLI-Vertrag ein
+    Komponente ist verschwunden oder wurde durch einen Symlink ersetzt. Da der
+    Pfad vorab bereits durch resolve_ondisk() und checked_path() verifiziert
+    wurde, bedeutet ein fehlender Pfad hier immer eine nachträgliche Änderung.
+    Der aufgelöste Pfad ist damit nicht mehr der geprüfte — laut CLI-Vertrag ein
     Pfadfehler (Exit 3), kein Laufzeitfehler. Alle anderen Fehler (z.B. EACCES)
     bleiben echte Laufzeitfehler.
     """
-    import errno
     try:
         return _open_canonical_dir(dirpath)
     except OSError as exc:
@@ -896,33 +899,47 @@ _MAXPATHLEN = 1024
 
 def _fd_path(dirfd):
     """Aktueller Pfad eines geöffneten Verzeichnisses."""
-    import fcntl
     raw = fcntl.fcntl(dirfd, _F_GETPATH, bytes(_MAXPATHLEN))
     return os.fsdecode(raw.split(b"\0", 1)[0])
 
 
-def _assert_dir_unmoved(dirfd, dirpath):
-    """Prüft unmittelbar vor einer Umbenennung, dass das Verzeichnis noch dort liegt.
+def _assert_dir_unmoved(dirfd, roots):
+    """Prüft beim Betreten eines Verzeichnisses, dass es in einer Syncwurzel liegt.
 
     Ein Deskriptor hängt an der Inode, nicht am Pfad: Wird das geöffnete
     Verzeichnis während des Laufs verschoben — etwa aus der Syncwurzel heraus —,
     wirken renameat-Aufrufe weiterhin darin, dann aber außerhalb jeder
-    registrierten Wurzel. ``dirpath`` stammt immer aus checked_path() (bzw. aus
-    daran angehängten Namen) und liegt damit garantiert in einer Wurzel; stimmt
-    der aktuelle Pfad der Inode damit überein, ist die Grenze eingehalten.
-    Sonst: Pfadfehler, kein Rename.
+    registrierten Wurzel.
 
-    Verglichen wird normalisiert, weil APFS Namen so speichert, wie sie angelegt
-    wurden, sie aber auch in der anderen Unicode-Normalform (NFC/NFD) findet —
-    ein Umlaut darf keinen Fehlalarm auslösen.
+    F_GETPATH liefert den aktuellen Kernel-Pfad der Inode. Liegt dieser weiterhin
+    unter einer registrierten Syncwurzel und stimmt die Inode noch mit dem
+    Pfad überein (samestat), ist die Invariante gewahrt. Schlägt F_GETPATH fehl
+    (z.B. Pfadtiefe > MAXPATHLEN) oder liegt der Pfad außerhalb: fail-closed als
+    PathOutsideRoots.
+
+    Hinweis: Dies ist eine zeitliche Eingrenzung beim Betreten jedes Verzeichnisses,
+    keine atomare Garantie gegen paralleles Verschieben im Nanosekundenfenster.
     """
-    import unicodedata
-    current = _fd_path(dirfd)
-    if (unicodedata.normalize("NFC", current)
-            != unicodedata.normalize("NFC", dirpath)):
+    try:
+        current = _fd_path(dirfd)
+    except OSError as exc:
         raise PathOutsideRoots(
-            "Verzeichnis liegt jetzt unter %s statt %s — kein Rename"
-            % (current, dirpath))
+            "Verzeichnispfad konnte nicht verifiziert werden: %s"
+            % (exc.strerror or exc))
+
+    if not in_any_folder(current, roots):
+        raise PathOutsideRoots(
+            "Verzeichnis liegt jetzt außerhalb aller Syncwurzeln (%s) — kein Rename"
+            % current)
+
+    try:
+        if not os.path.samestat(os.fstat(dirfd), os.stat(current)):
+            raise PathOutsideRoots(
+                "Verzeichnis-Deskriptor stimmt nicht mehr mit Pfad %s überein"
+                % current)
+    except OSError:
+        raise PathOutsideRoots(
+            "Verzeichnis %s konnte nicht mehr stat-geprüft werden" % current)
 
 
 def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
@@ -931,10 +948,8 @@ def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
     Alle Dateisystemzugriffe laufen relativ zum geöffneten Verzeichnis-fd
     (openat-Semantik): Auch wenn der Pfad danach durch Symlinks ausgetauscht
     wird, wirken Prüfungen und Renames weiter im ursprünglichen, an der
-    Syncwurzel verifizierten Verzeichnis. ``dirpath`` dient dem Journalabgleich,
-    den Fehlertexten und der Grenzprüfung unmittelbar vor jeder Umbenennung
-    (_assert_dir_unmoved): Der fd allein sagt nicht, ob das Verzeichnis
-    inzwischen aus der Syncwurzel herausgewandert ist.
+    Syncwurzel verifizierten Verzeichnis. ``dirpath`` dient dem Journalabgleich
+    und den Fehlermeldungen.
     """
     logical_name = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else name
     placeholder_name = logical_name + SUFFIX
@@ -947,7 +962,6 @@ def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
     if target == "local":
         if logical_exists:
             return  # schon lokal (oder Download läuft bereits)
-        _assert_dir_unmoved(dirfd, dirpath)
         _rename_excl_at(dirfd, placeholder_name, logical_name)
         return
     # target == "online"
@@ -974,7 +988,6 @@ def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
     # vor der Umbenennung, nicht aus dem oben gelesenen (dann evtl. veralteten)
     # Stat-Ergebnis.
     _require_synced(logical, rename_ctx, dirfd=dirfd, name=logical_name)
-    _assert_dir_unmoved(dirfd, dirpath)
     _rename_excl_at(dirfd, logical_name, placeholder_name)
 
 
@@ -983,6 +996,7 @@ def _rename_pin_file(ondisk, target, rename_ctx, roots):
     parent = os.path.dirname(ondisk)
     dirfd = _open_checked_dir(parent, roots)
     try:
+        _assert_dir_unmoved(dirfd, roots)
         _rename_pin_at(dirfd, parent, os.path.basename(ondisk), target,
                        rename_ctx)
     finally:
@@ -999,20 +1013,20 @@ def _is_expected_race(exc):
     bedeutet, dass eine sichtbare Datei NICHT umbenannt wurde, und muss
     gemeldet werden; sonst endet der Lauf fälschlich mit Exit 0.
     """
-    import errno
     return exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 
 
-def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, skipped, counted):
+def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted):
     """Rekursive Ordner-Abarbeitung über Verzeichnis-fds (openat-Semantik).
 
     Sichtbare reguläre Dateien werden umbenannt; versteckte Einträge und
-    Symlinks fliegen raus. Unterverzeichnisse werden mit O_NOFOLLOW relativ
-    zum Eltern-fd geöffnet: Ein während des Laufs durch einen Symlink
-    ersetztes Verzeichnis lässt sich so nicht öffnen, die Traversierung kann
-    die geprüfte Syncwurzel also nicht verlassen (frühere os.walk-Variante:
-    Symlink-Check und Abstieg waren getrennte Schritte mit Zeitfenster).
+    Symlinks fliegen raus (dieselbe Regel wie im Zustandsleser fs_folder_state).
+    Unterverzeichnisse werden mit O_NOFOLLOW relativ zum Eltern-fd geöffnet:
+    Ein während des Laufs durch einen Symlink ersetztes Verzeichnis lässt sich so
+    nicht öffnen, die Traversierung kann die geprüfte Syncwurzel also nicht
+    verlassen. Beim Betreten jedes Verzeichnisses wird _assert_dir_unmoved geprüft.
     """
+    _assert_dir_unmoved(dirfd, roots)
     for entry in sorted(os.scandir(dirfd), key=lambda e: e.name):
         name = entry.name
         if name.startswith("."):
@@ -1024,7 +1038,7 @@ def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, skipped, counted):
                 subfd = os.open(name, _O_DIR_NOFOLLOW, dir_fd=dirfd)
                 try:
                     _rename_pin_tree(subfd, os.path.join(dirpath, name),
-                                     target, rename_ctx, skipped, counted)
+                                     target, rename_ctx, roots, skipped, counted)
                 finally:
                     os.close(subfd)
             elif entry.is_file(follow_symlinks=False):
@@ -1059,13 +1073,15 @@ def rename_do_action(ondisk, target, rename_ctx, roots):
         # Rekursion nur noch relativ zu geöffneten Verzeichnissen weiter.
         dirfd = _open_checked_dir(ondisk, roots)
         try:
-            _rename_pin_tree(dirfd, ondisk, target, rename_ctx, skipped,
+            _rename_pin_tree(dirfd, ondisk, target, rename_ctx, roots, skipped,
                              counted)
         finally:
             os.close(dirfd)
         if skipped:
             raise RuntimeError("%d von %d Datei(en) übersprungen — z.B.: %s"
                                % (len(skipped), counted[0], skipped[0]))
+        if counted[0] == 0:
+            raise RuntimeError("keine regulären Dateien im Ordner gefunden")
         return
     _rename_pin_file(ondisk, target, rename_ctx, roots)
 
@@ -1321,7 +1337,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.2")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.3")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)

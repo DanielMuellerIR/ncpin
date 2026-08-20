@@ -276,6 +276,10 @@ class RenameTransportRoundtripTests(unittest.TestCase):
         self.logical = os.path.join(self.tmp.name, "fixture.bin")
         self.placeholder = self.logical + self.bench.SUFFIX
         self.verbs = []
+        for attribute, value in (("SETTLE_POLLS", 0), ("SETTLE_PAUSE", 0)):
+            patcher = mock.patch.object(self.bench, attribute, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -409,6 +413,52 @@ class RenameTransportRoundtripTests(unittest.TestCase):
         self.assertEqual(self.verbs,
                          ["status", "online", "status", "status",
                           "local", "status", "status"])
+
+    def test_reassert_initial_state_detects_ondisk_mismatch_with_real_files(self):
+        with open(self.logical, "wb") as handle:
+            handle.write(b"voller inhalt")
+
+        # Anfang: lokal. Hin-Befehl schlaegt fehl.
+        # Im Restore wird 'local' ausgefuehrt, aber die Datei wurde z.B. suffigiert.
+        def fail_online():
+            pass
+
+        def reassert_local_leaves_placeholder():
+            # Simuliert, dass 'local' zwar rc=0 liefert, die Datei aber noch als Platzhalter liegt
+            if os.path.exists(self.logical):
+                os.rename(self.logical, self.placeholder)
+                with open(self.placeholder, "wb") as h:
+                    h.write(b" ")
+
+        effects = [("online", fail_online, 1),
+                   ("local", reassert_local_leaves_placeholder, 0)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 5.0)
+
+        self.assertFalse(result["ok"])
+        # Da initial_ondisk (logical) != final_ondisk (placeholder), darf restore_verified nicht True sein
+        self.assertFalse(result["restore_verified"])
+
+    def test_persistent_unknown_state_attempts_reassertion(self):
+        with open(self.logical, "wb") as handle:
+            handle.write(b"voller inhalt")
+
+        def fail_online():
+            pass
+
+        # Bei persistentem unknown wird trotzdem der Ausgangszustand 'local' beauftragt
+        effects = [("online", fail_online, 1),
+                   ("local", lambda: None, 0)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 5.0)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["restore_verified"])
+        self.assertEqual(self.verbs,
+                         ["status", "online", "status", "status",
+                          "local", "status"])
 
 
 class FixtureSocketIntegrationTests(unittest.TestCase):

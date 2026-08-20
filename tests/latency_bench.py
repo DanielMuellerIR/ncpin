@@ -486,44 +486,21 @@ def roundtrip(runner, sample, timeout):
         result["restore_ondisk"] = current_ondisk
         path_stable = (initial_ondisk is None
                        or current_ondisk == initial_ondisk)
-        if current_state == initial_state and path_stable:
-            # Zustand und Pfad sehen aus wie am Anfang. Das allein ist bei
-            # fire-and-forget kein Beweis: Der gesendete Befehl kann auch nach
-            # dem Nachbeobachtungsfenster noch wirken. Also den Anfangszustand
-            # aktiv erneut beauftragen und das Ergebnis pollen, statt ihn nur
-            # zu erwarten.
-            result["restore_verified"] = _reassert_initial_state(
-                runner, sample, timeout, initial_state, initial_ondisk, result)
-        elif (initial_ondisk is not None and current_ondisk is not None
+        if (initial_ondisk is not None and current_ondisk is not None
                 and current_ondisk != initial_ondisk):
             # Der Pfadname weicht ab -> ein Rename-Uebergang steht noch aus,
             # auch wenn der abstrakte Zustand scheinbar schon wieder passt.
             result["restore_verified"] = _revert_pending_transition(
                 runner, sample, timeout, initial_state, initial_ondisk, result,
                 current_state=current_state)
-        elif current_state in ("local", "online"):
-            dt, rc, out, err = run_ncpin(
-                runner, [initial_state, sample, "--wait", "--timeout", str(timeout)])
-            final_state, final_probe = read_status_state(runner, sample)
-            final_ondisk = _ondisk_representation(sample)
-            restored = (rc == 0 and final_state == initial_state
-                        and (initial_ondisk is None
-                             or final_ondisk == initial_ondisk))
-            result["steps"].append({
-                "target": initial_state,
-                "elapsed_ms": round(dt * 1000, 1),
-                "reached": restored,
-                "rc": rc,
-                "stdout": out.strip(),
-                "stderr": err.strip(),
-                "observed_state": final_state,
-                "restoration": True,
-            })
-            result["final_probe"] = final_probe
-            result["final_ondisk"] = final_ondisk
-            result["restore_verified"] = restored
         else:
-            result["error"] = "Zustand nach Roundtrip unbekannt; Restore nicht blind ausgefuehrt."
+            # Zustand und Pfad sehen aus wie am Anfang, oder Uebergang ist abgeschlossen,
+            # oder Zustand ist unbekannt: In allen diesen Faellen den bekannten
+            # Anfangszustand aktiv erneut beauftragen und das Ergebnis pollen.
+            result["restore_verified"] = _reassert_initial_state(
+                runner, sample, timeout, initial_state, initial_ondisk, result)
+            if not result["restore_verified"] and current_state not in ("local", "online"):
+                result["error"] = "Zustand nach Roundtrip unbekannt und Restore nicht bestaetigt."
     result["ok"] = transition_ok and result["restore_verified"]
     return result
 
@@ -682,8 +659,9 @@ def _emit(report, as_json):
         print("")
         print("  Roundtrip (netzabhaengig, nicht gegated): %s" % ("OK" if rt["ok"] else "FEHLER"))
         for s in rt["steps"]:
-            print("    -> %-7s %8.1fms  %s"
-                  % (s["target"], s["elapsed_ms"], "✓" if s["reached"] else "✗"))
+            tag = " (Restore)" if s.get("restoration") else ""
+            print("    -> %-7s %8.1fms  %s%s"
+                  % (s["target"], s["elapsed_ms"], "✓" if s["reached"] else "✗", tag))
     print("")
     verdict = "GRUEN" if report["gate_pass"] else "ROT"
     print("  Gate: %s" % verdict)
