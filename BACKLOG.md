@@ -23,9 +23,6 @@
    im isolierten Installer-Harness abgedeckt.
 4. Foto-Pin-Iconvariante als kuratiertes Asset-Experiment; vorhandene flache
    Icons bleiben bis zu einer bewussten Auswahl gültig.
-5. Vor einer öffentlichen Veröffentlichung vollständigen Privacy-/Signing-
-   Preflight und Tests auf mindestens einem gesunden Finder-System ausführen.
-
 Nicht offen: der sichere Roundtrip mit explizitem Fixture, die frühere
 Drei-Sekunden-Grundlatenz, fehlende TCC-Identität und Asset-Katalog-Überdeckung.
 Das sind implementierte beziehungsweise verifizierte Dauerfallen im
