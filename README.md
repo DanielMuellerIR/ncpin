@@ -37,8 +37,9 @@ uses one of two transports (chosen automatically):
   requests from the filesystem in suffix mode: renaming `file.pdf.nextcloud` → `file.pdf` makes the
   client download the file; the reverse rename makes it dehydrate. ncpin performs exactly these
   renames, reads the state straight from the filesystem, takes the sync roots from the client's
-  `nextcloud.cfg`, and — before dehydrating — verifies against the client's sync journal that the
-  file is fully synced (otherwise the engine would silently ignore the request).
+  `nextcloud.cfg`, and verifies every rename against the client's sync journal. Hydration requires
+  a virtual record with matching inode and mtime; dehydration requires matching size and mtime.
+  A mismatch is rejected before any file in a folder is renamed.
 
 As long as the Nextcloud client is running, ncpin works — extension or not.
 
@@ -220,9 +221,10 @@ Client v34 removed the socket API on macOS; its XPC replacement only accepts Nex
 signed processes. ncpin therefore drives the sync engine through the mechanism it has built in
 for suffix mode ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stable-34.0/src/libsync/discovery.cpp)):
 
-- **hydrate:** rename `file.pdf.nextcloud` → `file.pdf` (a plain `os.rename` keeps inode and
-  mtime, which is exactly what the engine checks) — the client's file watcher picks it up and
-  downloads the content;
+- **hydrate:** rename `file.pdf.nextcloud` → `file.pdf`. Before the rename, ncpin requires a
+  virtual journal record whose inode and mtime match the 1-byte placeholder. A stale inode would
+  make the client create a conflict copy instead of recognizing the download request, so ncpin
+  rejects it;
 - **dehydrate:** rename `file.pdf` → `file.pdf.nextcloud` — the client replaces the content with
   a 1-byte placeholder. The engine only accepts this if size and mtime still match its sync
   journal, so ncpin verifies that **first** (against an APFS clone of the journal, since the
@@ -232,7 +234,8 @@ for suffix mode ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stabl
   1 byte (the same heuristic the engine itself uses);
 - **sync roots:** taken from the client's `nextcloud.cfg` (folders with `virtualFilesMode=suffix`);
   the same path-boundary checks apply as with the socket transport;
-- **folders:** recursed by ncpin itself, file by file.
+- **folders:** recursed by ncpin itself. Hydration preflights the complete tree before the first
+  rename, so one stale journal entry cannot leave an intentionally half-hydrated folder.
 
 Edge case inherited from the engine: a genuine 1-byte file is indistinguishable from a fresh
 placeholder and reports as `online`.

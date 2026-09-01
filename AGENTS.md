@@ -70,6 +70,11 @@ Dehydrierung. Verträge dieses Transports:
 - Zustand kommt direkt vom Dateisystem: Platzhalter = Suffix + exakt 1 Byte —
   dieselbe Heuristik wie in der Engine; eine echte 1-Byte-Datei meldet
   dadurch `online` (geerbter Grenzfall).
+- Die Engine erkennt eine Hydrierungs-Umbenennung nur, wenn der Journal-Eintrag
+  virtuell ist und Inode, mtime sowie die lokale 1-Byte-Größe passen. Bei einem
+  veralteten Journal-Inode erzeugt sie sonst eine Konfliktkopie. ncpin prüft
+  diese Werte vor jedem Hydrier-Rename; Ordner werden vollständig vorgeprüft,
+  bevor die erste Datei umbenannt wird. Nie ungeprüft hydrieren.
 - Die Engine akzeptiert eine Dehydrierungs-Umbenennung nur, wenn Größe und
   mtime zum Sync-Journal passen, und ignoriert sie sonst still. ncpin prüft
   das vorher gegen einen APFS-Klon des Journals (`cp -c`; der laufende Client

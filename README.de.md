@@ -37,9 +37,10 @@ zwei Transporten (automatisch gewählt):
   Pin-Wünsche im suffix-Modus aber weiterhin aus dem Dateisystem: `datei.pdf.nextcloud` →
   `datei.pdf` umbenennen lässt den Client die Datei herunterladen; die Gegenrichtung dehydriert
   sie. ncpin führt genau diese Umbenennungen aus, liest den Zustand direkt vom Dateisystem, holt
-  die Syncwurzeln aus der `nextcloud.cfg` des Clients und prüft vor einer Dehydrierung gegen das
-  Sync-Journal, dass die Datei fertig gesynct ist (sonst würde die Engine den Wunsch still
-  ignorieren).
+  die Syncwurzeln aus der `nextcloud.cfg` des Clients und prüft jede Umbenennung gegen das
+  Sync-Journal. Hydrierungen verlangen einen virtuellen Eintrag mit passendem Inode und mtime,
+  Dehydrierungen passende Größe und mtime. Bei einer Abweichung bricht ncpin ab, bevor es im Ordner
+  die erste Datei umbenennt.
 
 Solange der Nextcloud-Client läuft, funktioniert ncpin — Extension hin oder her.
 
@@ -225,9 +226,10 @@ Client v34 hat die Socket-API auf macOS entfernt; der XPC-Ersatz akzeptiert nur 
 signierte Prozesse. ncpin steuert die Sync-Engine deshalb über die Mechanik, die sie für den
 suffix-Modus eingebaut hat ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stable-34.0/src/libsync/discovery.cpp)):
 
-- **hydrieren:** `datei.pdf.nextcloud` → `datei.pdf` umbenennen (ein einfaches `os.rename` erhält
-  Inode und mtime — genau das prüft die Engine); der Dateiwächter des Clients bemerkt es und lädt
-  den Inhalt herunter;
+- **hydrieren:** `datei.pdf.nextcloud` → `datei.pdf` umbenennen. Vorher verlangt ncpin einen
+  virtuellen Journal-Eintrag, dessen Inode und mtime zum 1-Byte-Platzhalter passen. Bei einem
+  veralteten Inode würde der Client statt des Downloadwunsches eine Konfliktkopie erkennen; ncpin
+  lehnt den Rename deshalb ab;
 - **dehydrieren:** `datei.pdf` → `datei.pdf.nextcloud` umbenennen — der Client ersetzt den Inhalt
   durch einen 1-Byte-Platzhalter. Die Engine akzeptiert das nur, wenn Größe und mtime noch zum
   Sync-Journal passen; ncpin prüft das deshalb **vorher** (gegen einen APFS-Klon des Journals, da
@@ -237,7 +239,9 @@ suffix-Modus eingebaut hat ([discovery.cpp](https://github.com/nextcloud/desktop
   1 Byte (dieselbe Heuristik verwendet die Engine selbst);
 - **Syncwurzeln:** aus der `nextcloud.cfg` des Clients (Ordner mit `virtualFilesMode=suffix`);
   es gelten dieselben Pfadgrenzen-Prüfungen wie beim Socket-Transport;
-- **Ordner:** rekursiert ncpin selbst, Datei für Datei.
+- **Ordner:** rekursiert ncpin selbst. Vor einer Hydrierung prüft es den gesamten Baum, bevor es
+  die erste Datei umbenennt; ein veralteter Journal-Eintrag hinterlässt damit keinen absichtlich
+  halb hydrierten Ordner.
 
 Von der Engine geerbter Grenzfall: Eine echte 1-Byte-Datei ist von einem frischen Platzhalter
 nicht unterscheidbar und wird als `online` gemeldet.

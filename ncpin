@@ -34,9 +34,11 @@ ncpin kennt zwei Transporte und wählt automatisch:
        sofern sie fertig gesynct ist (mtime+Größe müssen zum Journal passen)
    ncpin nutzt genau diese Mechanik: Aktion = os.rename, den Sync stößt der
    Dateiwächter des Clients selbst an. Der Zustand kommt direkt aus dem
-   Dateisystem, die Syncwurzeln aus der nextcloud.cfg des Clients, und vor
-   einer Dehydrierung prüft ncpin gegen das Sync-Journal, dass die Datei
-   fertig hochgeladen ist (sonst würde der Client den Wunsch still ignorieren).
+   Dateisystem, die Syncwurzeln aus der nextcloud.cfg des Clients. Vor einer
+   Hydrierung prüft ncpin Typ, Inode, mtime und Platzhaltergröße gegen das
+   Sync-Journal (sonst erzeugt der Client Konfliktkopien); vor einer
+   Dehydrierung prüft es Größe und mtime (sonst ignoriert der Client den Wunsch
+   still).
 
 Headless/AI-Agent (maschinenlesbar):
   ncpin status --json <pfad>     -> JSON je Pfad, Exit-Code spricht Bände
@@ -405,12 +407,14 @@ def wait_for_state(sock_path, orig_path, target, timeout, roots):
 #   2. Zustand direkt vom Dateisystem lesen (ersetzt GET_MENU_ITEMS) —
 #      ein Platzhalter ist "<name>.nextcloud" mit exakt 1 Byte, dieselbe
 #      Heuristik verwendet die Engine selbst (discovery.cpp),
-#   3. vor einer Dehydrierung gegen das Sync-Journal (SQLite) prüfen, dass
-#      die Datei fertig gesynct ist — sonst ignoriert der Client den Wunsch
-#      still und es bliebe eine verwirrende "<name>.nextcloud" mit Vollinhalt.
+#   3. vor jedem Rename gegen das Sync-Journal (SQLite) prüfen: Hydrierungen
+#      brauchen passenden Typ, Inode, mtime und 1-Byte-Größe, Dehydrierungen
+#      passende Größe und mtime. Sonst erzeugt der Client Konfliktkopien oder
+#      ignoriert den Wunsch still.
 
 CONFIG_ENV = "NCPIN_CONFIG"      # Config-Pfad für Tests überschreibbar
 PLACEHOLDER_SIZE = 1             # Größe eines dehydrierten Platzhalters (Byte)
+JOURNAL_TYPE_VIRTUAL_FILE = 4    # CSyncEnums::ItemTypeVirtualFile
 FOLDER_SCAN_CAP = 512            # Stichproben-Deckel für Ordner-Zustand
 
 # Sync-Ordner-Schlüssel in der nextcloud.cfg (QSettings-Format), z.B.:
@@ -663,13 +667,13 @@ def _journal_file_for(folder):
     hits = sorted(glob.glob(os.path.join(folder["path"], ".sync_*.db")))
     if len(hits) > 1:
         raise RuntimeError(
-            "mehrere Sync-Journale in %s gefunden — Dehydrierung abgelehnt"
+            "mehrere Sync-Journale in %s gefunden — Aktion abgelehnt"
             % folder["path"])
     return hits[0] if hits else None
 
 
 def _load_journal_entries(folder):
-    """Lädt alle Datei-Einträge des Sync-Journals: {relpfad: (größe, mtime)}.
+    """Lädt Journal-Metadaten: {relpfad: (größe, mtime, inode, typ)}.
 
     Der laufende Client hält sein Journal mit locking_mode=EXCLUSIVE gesperrt —
     direkt lesen geht nicht. Darum wird das Journal (plus WAL/SHM) zuerst als
@@ -684,7 +688,7 @@ def _load_journal_entries(folder):
     source = _journal_file_for(folder)
     if not source:
         raise RuntimeError(
-            "kein Sync-Journal in %s gefunden — Dehydrierung abgelehnt" % folder["path"])
+            "kein Sync-Journal in %s gefunden — Aktion abgelehnt" % folder["path"])
     tmpdir = tempfile.mkdtemp(prefix="ncpin-journal-")
     try:
         base = os.path.join(tmpdir, os.path.basename(source))
@@ -703,21 +707,22 @@ def _load_journal_entries(folder):
             # WAL in die Kopie einspielen dürfen; das Original bleibt unberührt.
             conn = sqlite3.connect(base)
             try:
-                rows = conn.execute("SELECT path, filesize, modtime FROM metadata")
-                for path, filesize, modtime in rows:
-                    entries[path] = (filesize, modtime)
+                rows = conn.execute(
+                    "SELECT path, filesize, modtime, inode, type FROM metadata")
+                for path, filesize, modtime, inode, item_type in rows:
+                    entries[path] = (filesize, modtime, inode, item_type)
             finally:
                 conn.close()
         except sqlite3.Error as exc:
             raise RuntimeError(
-                "Sync-Journal nicht lesbar (%s) — Dehydrierung abgelehnt" % exc)
+                "Sync-Journal nicht lesbar (%s) — Aktion abgelehnt" % exc)
         return entries
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _journal_entry_for(logical, rename_ctx):
-    """Journal-Eintrag (größe, mtime) einer Datei oder None.
+    """Journal-Eintrag (Größe, mtime, Inode, Typ) einer Datei oder None.
 
     macOS liefert Dateinamen mal NFD, mal NFC; das Journal speichert die
     Server-Schreibweise. Darum werden beide Normalformen probiert.
@@ -760,7 +765,7 @@ def _require_synced(logical, rename_ctx, dirfd=None, name=None):
     if entry is None:
         raise RuntimeError(
             "nicht im Sync-Journal (noch nicht hochgeladen?) — Dehydrierung abgelehnt")
-    filesize, modtime = entry
+    filesize, modtime, _inode, _item_type = entry
     if dirfd is None:
         st = os.stat(logical)
     else:
@@ -768,6 +773,62 @@ def _require_synced(logical, rename_ctx, dirfd=None, name=None):
     if st.st_size != filesize or int(st.st_mtime) != int(modtime):
         raise RuntimeError(
             "lokale Änderung noch nicht gesynct — Dehydrierung abgelehnt")
+
+
+def _require_hydratable(placeholder, rename_ctx, dirfd, placeholder_name):
+    """Prüft Nextclouds Bedingungen für einen sicheren Hydrier-Rename.
+
+    Nextcloud erkennt ``name.nextcloud -> name`` nur dann als Downloadwunsch,
+    wenn der Journal-Eintrag virtuell ist und Inode, Änderungszeit sowie die
+    1-Byte-Platzhaltergröße noch passen. Bei einem veralteten Journal-Inode
+    behandelt der Client den umbenannten Platzhalter sonst als lokale Änderung,
+    erzeugt eine ``conflicted copy`` und lädt das Serveroriginal daneben.
+
+    Der Journal-Clone wird durch _journal_entry_for() beim ersten Aufruf geladen;
+    das Stat folgt danach frisch über den geöffneten Verzeichnis-Deskriptor.
+    """
+    # Im suffix-Modus speichert Nextcloud auch den Suffix im Journalpfad.
+    # Der logische Zielname hat deshalb keinen Eintrag, der Platzhalter schon.
+    entry = _journal_entry_for(placeholder, rename_ctx)
+    if entry is None:
+        raise RuntimeError(
+            "nicht im Sync-Journal — Hydrierung abgelehnt")
+    _filesize, modtime, inode, item_type = entry
+    if item_type != JOURNAL_TYPE_VIRTUAL_FILE:
+        raise RuntimeError(
+            "kein virtueller Journal-Eintrag — Hydrierung abgelehnt")
+
+    st = os.stat(placeholder_name, dir_fd=dirfd, follow_symlinks=False)
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError(
+            "kein regulärer Platzhalter — Hydrierung abgelehnt")
+    if st.st_size != PLACEHOLDER_SIZE:
+        raise RuntimeError(
+            "Platzhalter %s hat %d statt %d Byte — Hydrierung abgelehnt"
+            % (placeholder_name, st.st_size, PLACEHOLDER_SIZE))
+    if int(st.st_mtime) != int(modtime):
+        raise RuntimeError(
+            "Platzhalter-Änderungszeit stimmt nicht mit dem Sync-Journal "
+            "überein — Hydrierung abgelehnt")
+    if st.st_ino != inode:
+        raise RuntimeError(
+            "Platzhalter-Inode %d stimmt nicht mit Journal-Inode %d überein "
+            "— Hydrierung abgelehnt" % (st.st_ino, inode))
+
+
+def _validate_local_pin_at(dirfd, dirpath, logical_name, placeholder_name,
+                           rename_ctx):
+    """Prüft Namen und Journal; True bedeutet: Rename ist noch nötig."""
+    logical_exists = _lexists_at(dirfd, logical_name)
+    placeholder_exists = _lexists_at(dirfd, placeholder_name)
+    if logical_exists and placeholder_exists:
+        raise RuntimeError(
+            "logischer Name und Platzhalter existieren beide — nicht eindeutig")
+    if logical_exists:
+        return False  # schon lokal oder Download läuft bereits
+    placeholder = os.path.join(dirpath, placeholder_name)
+    _require_hydratable(placeholder, rename_ctx, dirfd, placeholder_name)
+    return True
 
 
 # Verzeichnisse während der Rekursion sicher öffnen: O_NOFOLLOW macht Prüfung
@@ -940,6 +1001,7 @@ def _assert_dir_unmoved(dirfd, roots):
     except OSError:
         raise PathOutsideRoots(
             "Verzeichnis %s konnte nicht mehr stat-geprüft werden" % current)
+    return current
 
 
 def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
@@ -954,17 +1016,18 @@ def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
     logical_name = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else name
     placeholder_name = logical_name + SUFFIX
     logical = os.path.join(dirpath, logical_name)
+    if target == "local":
+        if not _validate_local_pin_at(
+                dirfd, dirpath, logical_name, placeholder_name, rename_ctx):
+            return
+        _rename_excl_at(dirfd, placeholder_name, logical_name)
+        return
+    # target == "online"
     logical_exists = _lexists_at(dirfd, logical_name)
     placeholder_exists = _lexists_at(dirfd, placeholder_name)
     if logical_exists and placeholder_exists:
         raise RuntimeError(
             "logischer Name und Platzhalter existieren beide — nicht eindeutig")
-    if target == "local":
-        if logical_exists:
-            return  # schon lokal (oder Download läuft bereits)
-        _rename_excl_at(dirfd, placeholder_name, logical_name)
-        return
-    # target == "online"
     if not logical_exists:
         # Schon online-only — aber nur, wenn der Platzhalter wirklich ein
         # gültiger 1-Byte-Platzhalter ist. Ein Platzhalter mit anderer Größe
@@ -996,8 +1059,8 @@ def _rename_pin_file(ondisk, target, rename_ctx, roots):
     parent = os.path.dirname(ondisk)
     dirfd = _open_checked_dir(parent, roots)
     try:
-        _assert_dir_unmoved(dirfd, roots)
-        _rename_pin_at(dirfd, parent, os.path.basename(ondisk), target,
+        current_parent = _assert_dir_unmoved(dirfd, roots)
+        _rename_pin_at(dirfd, current_parent, os.path.basename(ondisk), target,
                        rename_ctx)
     finally:
         os.close(dirfd)
@@ -1016,7 +1079,8 @@ def _is_expected_race(exc):
     return exc.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
 
 
-def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted):
+def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted,
+                     validate_only=False):
     """Rekursive Ordner-Abarbeitung über Verzeichnis-fds (openat-Semantik).
 
     Sichtbare reguläre Dateien werden umbenannt; versteckte Einträge und
@@ -1026,7 +1090,10 @@ def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted
     nicht öffnen, die Traversierung kann die geprüfte Syncwurzel also nicht
     verlassen. Beim Betreten jedes Verzeichnisses wird _assert_dir_unmoved geprüft.
     """
-    _assert_dir_unmoved(dirfd, roots)
+    # F_GETPATH liefert auch die tatsächlich gespeicherte Groß-/Kleinschreibung
+    # und Unicode-Form. Der Journalpfad muss daraus entstehen, nicht aus einer
+    # vom Nutzer abweichend geschriebenen, aber auf APFS gültigen Variante.
+    dirpath = _assert_dir_unmoved(dirfd, roots)
     for entry in sorted(os.scandir(dirfd), key=lambda e: e.name):
         name = entry.name
         if name.startswith("."):
@@ -1038,12 +1105,21 @@ def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted
                 subfd = os.open(name, _O_DIR_NOFOLLOW, dir_fd=dirfd)
                 try:
                     _rename_pin_tree(subfd, os.path.join(dirpath, name),
-                                     target, rename_ctx, roots, skipped, counted)
+                                     target, rename_ctx, roots, skipped, counted,
+                                     validate_only=validate_only)
                 finally:
                     os.close(subfd)
             elif entry.is_file(follow_symlinks=False):
                 counted[0] += 1
-                _rename_pin_at(dirfd, dirpath, name, target, rename_ctx)
+                if validate_only:
+                    logical_name = (name[:-len(SUFFIX)]
+                                    if name.endswith(SUFFIX) else name)
+                    placeholder_name = logical_name + SUFFIX
+                    _validate_local_pin_at(
+                        dirfd, dirpath, logical_name, placeholder_name,
+                        rename_ctx)
+                else:
+                    _rename_pin_at(dirfd, dirpath, name, target, rename_ctx)
         except RuntimeError as exc:
             skipped.append(str(exc))
         except OSError as exc:
@@ -1067,12 +1143,30 @@ def rename_do_action(ondisk, target, rename_ctx, roots):
             "Nextcloud-Client läuft nicht — Pin-Wunsch würde erst beim "
             "nächsten Start verarbeitet")
     if os.path.isdir(ondisk):
-        skipped = []
-        counted = [0]
         # Wurzel des Teilbaums symlinkfrei öffnen: Ab hier arbeitet die
         # Rekursion nur noch relativ zu geöffneten Verzeichnissen weiter.
         dirfd = _open_checked_dir(ondisk, roots)
         try:
+            # Hydrierungen zuerst über den GESAMTEN Baum prüfen. Damit kann ein
+            # statisch veralteter Journal-Inode nicht erst nach bereits
+            # umbenannten Nachbardateien auffallen und einen halben Ordner
+            # hinterlassen. Direkt vor jedem echten Rename prüft
+            # _rename_pin_at() dieselben Bedingungen erneut gegen Dateirennen.
+            if target == "local":
+                preflight_skipped = []
+                preflight_counted = [0]
+                _rename_pin_tree(
+                    dirfd, ondisk, target, rename_ctx, roots,
+                    preflight_skipped, preflight_counted, validate_only=True)
+                if preflight_skipped:
+                    raise RuntimeError(
+                        "%d von %d Datei(en) vor dem ersten Rename abgelehnt — "
+                        "z.B.: %s"
+                        % (len(preflight_skipped), preflight_counted[0],
+                           preflight_skipped[0]))
+
+            skipped = []
+            counted = [0]
             _rename_pin_tree(dirfd, ondisk, target, rename_ctx, roots, skipped,
                              counted)
         finally:
@@ -1337,7 +1431,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.3")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.4")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)

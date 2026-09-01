@@ -514,18 +514,20 @@ class RenameTransportTests(unittest.TestCase):
                 % self.root)
         self.journal = os.path.join(self.root, ".sync_test.db")
         conn = sqlite3.connect(self.journal)
-        conn.execute("CREATE TABLE metadata "
-                     "(path TEXT PRIMARY KEY, filesize INTEGER, modtime INTEGER)")
+        conn.execute(
+            "CREATE TABLE metadata "
+            "(path TEXT PRIMARY KEY, filesize INTEGER, modtime INTEGER, "
+            "inode INTEGER, type INTEGER)")
         conn.commit()
         conn.close()
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def journal_add(self, rel_path, filesize, modtime):
+    def journal_add(self, rel_path, filesize, modtime, inode, item_type=0):
         conn = sqlite3.connect(self.journal)
-        conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?, ?)",
-                     (rel_path, filesize, int(modtime)))
+        conn.execute("INSERT OR REPLACE INTO metadata VALUES (?, ?, ?, ?, ?)",
+                     (rel_path, filesize, int(modtime), int(inode), item_type))
         conn.commit()
         conn.close()
 
@@ -537,15 +539,23 @@ class RenameTransportTests(unittest.TestCase):
             handle.write(content)
         if synced:
             st = os.stat(full)
-            self.journal_add(rel_path, st.st_size, int(st.st_mtime))
+            self.journal_add(rel_path, st.st_size, int(st.st_mtime), st.st_ino)
         return full
 
-    def make_placeholder(self, rel_path):
-        """Legt einen dehydrierten 1-Byte-Platzhalter an."""
+    def make_placeholder(self, rel_path, synced=True, journal_inode=None,
+                         journal_modtime=None, journal_type=4):
+        """Legt einen dehydrierten 1-Byte-Platzhalter samt Journal-Eintrag an."""
         full = os.path.join(self.root, rel_path) + self.ncpin.SUFFIX
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "wb") as handle:
             handle.write(b" ")
+        if synced:
+            st = os.stat(full)
+            inode = st.st_ino if journal_inode is None else journal_inode
+            modtime = (int(st.st_mtime) if journal_modtime is None
+                       else journal_modtime)
+            self.journal_add(rel_path + self.ncpin.SUFFIX, 1234, modtime,
+                             inode, journal_type)
         return full
 
     def run_cli(self, *args, race=None):
@@ -601,6 +611,81 @@ class RenameTransportTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(placeholder))
         self.assertTrue(os.path.exists(logical))
+
+    def test_local_refuses_placeholder_missing_from_journal(self):
+        placeholder = self.make_placeholder("ohne-journal.mp4", synced=False)
+        logical = os.path.join(self.root, "ohne-journal.mp4")
+
+        rc, out, _err = self.run_cli("local", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Hydrierung abgelehnt", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(placeholder))
+        self.assertFalse(os.path.exists(logical))
+
+    def test_local_refuses_placeholder_with_stale_journal_inode(self):
+        placeholder = self.make_placeholder("stale-inode.mp4", synced=False)
+        st = os.stat(placeholder)
+        self.journal_add("stale-inode.mp4" + self.ncpin.SUFFIX,
+                         1234, int(st.st_mtime),
+                         st.st_ino + 1, item_type=4)
+        logical = os.path.join(self.root, "stale-inode.mp4")
+
+        rc, out, _err = self.run_cli("local", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Journal-Inode", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(placeholder))
+        self.assertFalse(os.path.exists(logical))
+
+    def test_local_refuses_placeholder_with_stale_journal_mtime(self):
+        placeholder = self.make_placeholder("stale-mtime.mp4", synced=False)
+        st = os.stat(placeholder)
+        self.journal_add("stale-mtime.mp4" + self.ncpin.SUFFIX,
+                         1234, int(st.st_mtime) - 10,
+                         st.st_ino, item_type=4)
+        logical = os.path.join(self.root, "stale-mtime.mp4")
+
+        rc, out, _err = self.run_cli("local", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("Änderungszeit", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(placeholder))
+        self.assertFalse(os.path.exists(logical))
+
+    def test_local_refuses_nonvirtual_journal_record(self):
+        placeholder = self.make_placeholder("falscher-typ.mp4", synced=False)
+        st = os.stat(placeholder)
+        self.journal_add("falscher-typ.mp4" + self.ncpin.SUFFIX,
+                         1234, int(st.st_mtime),
+                         st.st_ino, item_type=0)
+        logical = os.path.join(self.root, "falscher-typ.mp4")
+
+        rc, out, _err = self.run_cli("local", "--json", logical)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("kein virtueller Journal-Eintrag",
+                      json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(placeholder))
+        self.assertFalse(os.path.exists(logical))
+
+    def test_local_folder_preflight_prevents_partial_renames(self):
+        good = self.make_placeholder("baum/a-gueltig.mp4")
+        stale = self.make_placeholder("baum/z-stale.mp4", synced=False)
+        st = os.stat(stale)
+        self.journal_add("baum/z-stale.mp4" + self.ncpin.SUFFIX,
+                         1234, int(st.st_mtime),
+                         st.st_ino + 1, item_type=4)
+        folder = os.path.join(self.root, "baum")
+
+        rc, out, _err = self.run_cli("local", "--json", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("vor dem ersten Rename", json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(good))
+        self.assertTrue(os.path.exists(stale))
+        self.assertFalse(os.path.exists(good[:-len(self.ncpin.SUFFIX)]))
+        self.assertFalse(os.path.exists(stale[:-len(self.ncpin.SUFFIX)]))
 
     def test_online_renames_synced_file(self):
         logical = self.make_file("doku/bericht.pdf", b"voller inhalt")
