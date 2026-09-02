@@ -560,6 +560,42 @@ def fs_file_state(ondisk):
     return _state_from_size(os.path.basename(ondisk), size)
 
 
+def _iter_visible_files(folder, scan_errors):
+    """Liefert (Verzeichnispfad, DirEntry) für jede sichtbare Datei, lazy.
+
+    Ersatz für os.walk: os.walk liest jedes Verzeichnis KOMPLETT ein, bevor es
+    den ersten Eintrag liefert. Ein einzelner Ordner mit tausenden Einträgen
+    würde damit trotz FOLDER_SCAN_CAP vollständig materialisiert. os.scandir
+    gibt die Einträge dagegen einzeln heraus, so dass ein Abbruch am Deckel
+    wirklich nach FOLDER_SCAN_CAP gelesenen Einträgen stoppt.
+
+    Versteckte Einträge werden übersprungen, Symlinks nie verfolgt. Ein nicht
+    lesbares Verzeichnis landet in ``scan_errors`` (falls eine Liste übergeben
+    wird), statt still übergangen zu werden.
+    """
+    pending = [folder]
+    while pending:
+        current = pending.pop()
+        try:
+            iterator = os.scandir(current)
+        except OSError as exc:
+            if scan_errors is not None:
+                scan_errors.append(exc)
+            continue
+        with iterator:
+            try:
+                for entry in iterator:
+                    if entry.name.startswith("."):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                        continue
+                    yield current, entry
+            except OSError as exc:
+                if scan_errors is not None:
+                    scan_errors.append(exc)
+
+
 def fs_folder_state(folder, exact=False):
     """Aggregierter Zustand eines Ordners (rekursiv, mit frühem Ausstieg).
 
@@ -574,51 +610,43 @@ def fs_folder_state(folder, exact=False):
     Traversierung ohne Deckel, und jede "unknown"-Datei macht den ganzen
     Ordner "unknown" — eine Stichprobe könnte sonst einen gemischten Baum
     als einheitlich melden und toggle in die falsche Richtung schicken.
-    Ebenso zählt im exakten Modus jeder Scanfehler: os.walk übergeht einen
-    nicht lesbaren Unterordner sonst STILL, und ein Baum mit unsichtbarem
-    Platzhalter darunter käme fälschlich als einheitlich "local" heraus.
+    Ebenso zählt im exakten Modus jeder Scanfehler: Ein nicht lesbarer
+    Unterordner darf nie still übergangen werden, sonst käme ein Baum mit
+    unsichtbarem Platzhalter darunter fälschlich als einheitlich "local" heraus.
 
-    Gewertet werden nur sichtbare reguläre Dateien, per lstat und damit ohne einem
-    Symlink zu folgen. Der Aktionspfad (_rename_pin_tree) teilt exakt diese Regel
+    Gewertet werden nur sichtbare reguläre Dateien, per lstat-Semantik
+    (DirEntry.stat ohne follow_symlinks) und damit ohne einem Symlink zu folgen. Der Aktionspfad (_rename_pin_tree) teilt exakt diese Regel
     (nur sichtbare reguläre Dateien zählen); beide Stellen müssen zusammenpassen,
     damit Aktion und Warten dieselbe Aussage treffen.
     """
     seen_local = seen_online = False
     scanned = 0
-    # onerror sammelt die Fehler nur ein; entschieden wird am Ende (siehe unten).
-    scan_errors = []
-    walker = (os.walk(folder, onerror=scan_errors.append) if exact
-              else os.walk(folder))
-    for dirpath, dirnames, filenames in walker:
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        for name in filenames:
-            if name.startswith("."):
-                continue
-            if not exact:
-                scanned += 1
-                if scanned > FOLDER_SCAN_CAP:
-                    break
-            full = os.path.join(dirpath, name)
-            try:
-                st = os.lstat(full)
-            except OSError:
-                # Datei verschwunden oder nicht lesbar -> Zustand unklar.
-                state = "unknown"
-            else:
-                if not stat.S_ISREG(st.st_mode):
-                    continue  # Symlink/Sonderdatei: zählt nicht zum Zustand
-                state = _state_from_size(name, st.st_size)
-            if state == "local":
-                seen_local = True
-            elif state == "online":
-                seen_online = True
-            elif exact:
-                # z.B. Platzhalter mit falscher Größe: Zustand unklar.
-                return "unknown"
-            if seen_local and seen_online:
-                return "unknown"
-        if not exact and scanned > FOLDER_SCAN_CAP:
-            break
+    # Die Fehler werden nur eingesammelt; entschieden wird am Ende (siehe unten).
+    # Im Stichprobenmodus interessieren sie nicht (None = nicht sammeln).
+    scan_errors = [] if exact else None
+    for _dirpath, entry in _iter_visible_files(folder, scan_errors):
+        if not exact:
+            scanned += 1
+            if scanned > FOLDER_SCAN_CAP:
+                break
+        try:
+            st = entry.stat(follow_symlinks=False)
+        except OSError:
+            # Datei verschwunden oder nicht lesbar -> Zustand unklar.
+            state = "unknown"
+        else:
+            if not stat.S_ISREG(st.st_mode):
+                continue  # Symlink/Sonderdatei: zählt nicht zum Zustand
+            state = _state_from_size(entry.name, st.st_size)
+        if state == "local":
+            seen_local = True
+        elif state == "online":
+            seen_online = True
+        elif exact:
+            # z.B. Platzhalter mit falscher Größe: Zustand unklar.
+            return "unknown"
+        if seen_local and seen_online:
+            return "unknown"
     if scan_errors:
         # Ein Teilbaum blieb ungelesen -> der Gesamtzustand ist NICHT bekannt.
         return "unknown"
@@ -1004,25 +1032,10 @@ def _assert_dir_unmoved(dirfd, roots):
     return current
 
 
-def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
-    """Setzt den Pin-Wunsch für genau eine Datei per Umbenennung um.
-
-    Alle Dateisystemzugriffe laufen relativ zum geöffneten Verzeichnis-fd
-    (openat-Semantik): Auch wenn der Pfad danach durch Symlinks ausgetauscht
-    wird, wirken Prüfungen und Renames weiter im ursprünglichen, an der
-    Syncwurzel verifizierten Verzeichnis. ``dirpath`` dient dem Journalabgleich
-    und den Fehlermeldungen.
-    """
-    logical_name = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else name
-    placeholder_name = logical_name + SUFFIX
+def _validate_online_pin_at(dirfd, dirpath, logical_name, placeholder_name,
+                            rename_ctx):
+    """Prüft Namen, Inhalt und Journal; True bedeutet: Rename ist noch nötig."""
     logical = os.path.join(dirpath, logical_name)
-    if target == "local":
-        if not _validate_local_pin_at(
-                dirfd, dirpath, logical_name, placeholder_name, rename_ctx):
-            return
-        _rename_excl_at(dirfd, placeholder_name, logical_name)
-        return
-    # target == "online"
     logical_exists = _lexists_at(dirfd, logical_name)
     placeholder_exists = _lexists_at(dirfd, placeholder_name)
     if logical_exists and placeholder_exists:
@@ -1039,19 +1052,86 @@ def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx):
                 raise RuntimeError(
                     "Platzhalter %s hat %d statt %d Byte — Zustand unklar"
                     % (placeholder_name, pst.st_size, PLACEHOLDER_SIZE))
-        return
+        return False
     st = os.stat(logical_name, dir_fd=dirfd, follow_symlinks=False)
     if not stat.S_ISREG(st.st_mode):
         # Symlinks und Sonderdateien haben keinen dehydrierbaren Inhalt.
         raise RuntimeError("kein regulärer Dateiinhalt — Dehydrierung abgelehnt")
     if st.st_size == PLACEHOLDER_SIZE:
         # Sieht aus wie ein noch nicht hydrierter 1-Byte-Stub: nichts zu tun.
-        return
+        return False
     # Prüft gegen das Journal und liest Größe/mtime dabei frisch — unmittelbar
     # vor der Umbenennung, nicht aus dem oben gelesenen (dann evtl. veralteten)
     # Stat-Ergebnis.
     _require_synced(logical, rename_ctx, dirfd=dirfd, name=logical_name)
-    _rename_excl_at(dirfd, logical_name, placeholder_name)
+    return True
+
+
+def _validate_pin_at(dirfd, dirpath, name, target, rename_ctx):
+    """Prüft eine Datei für ``target`` und liefert (Quellname, Zielname).
+
+    None bedeutet: nichts zu tun (Zustand schon erreicht oder unentscheidbarer
+    1-Byte-Stub). Alle Prüfungen laufen relativ zum geöffneten Verzeichnis-fd.
+    """
+    logical_name = name[:-len(SUFFIX)] if name.endswith(SUFFIX) else name
+    placeholder_name = logical_name + SUFFIX
+    if target == "local":
+        if _validate_local_pin_at(dirfd, dirpath, logical_name,
+                                  placeholder_name, rename_ctx):
+            return placeholder_name, logical_name
+        return None
+    if _validate_online_pin_at(dirfd, dirpath, logical_name,
+                               placeholder_name, rename_ctx):
+        return logical_name, placeholder_name
+    return None
+
+
+def _rename_pin_at(dirfd, dirpath, name, target, rename_ctx, roots):
+    """Setzt den Pin-Wunsch für genau eine Datei per Umbenennung um.
+
+    Alle Dateisystemzugriffe laufen relativ zum geöffneten Verzeichnis-fd
+    (openat-Semantik): Auch wenn der Pfad danach durch Symlinks ausgetauscht
+    wird, wirken Prüfungen und Renames weiter im ursprünglichen, an der
+    Syncwurzel verifizierten Verzeichnis. ``dirpath`` dient dem Journalabgleich
+    und den Fehlermeldungen.
+
+    Zwischen Journalprüfung und Rename liegt Zeit (Journal-Klon, SQLite-Lesen).
+    Ein Deskriptor hängt an der Inode: Wird das geöffnete Verzeichnis in diesem
+    Fenster aus der Syncwurzel geschoben, würde der Rename dort draußen wirken.
+    Deshalb prüft _assert_dir_unmoved UNMITTELBAR vor jedem Rename erneut, dass
+    das Verzeichnis noch in einer registrierten Wurzel liegt.
+    """
+    names = _validate_pin_at(dirfd, dirpath, name, target, rename_ctx)
+    if names is None:
+        return
+    source_name, target_name = names
+    _assert_dir_unmoved(dirfd, roots)
+    _rename_excl_at(dirfd, source_name, target_name)
+
+
+def _stored_name_at(dirfd, name):
+    """Der tatsächlich gespeicherte Eintragsname zu einem Aufrufernamen.
+
+    APFS ist meist case-insensitive: ``CASENAME.TXT`` findet ``CaseName.txt``.
+    Suffix-Ableitung, Journalpfad und Rename müssen aber mit der gespeicherten
+    Schreibweise arbeiten, sonst sucht der Journalabgleich einen Schlüssel, den
+    es nicht gibt. Der Abgleich läuft über die Inode (samestat), fd-relativ,
+    also unabhängig vom Pfadstring. Ein exakt gleicher Name gewinnt, damit
+    Hardlinks im selben Ordner nicht den Namen tauschen.
+    """
+    st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    with os.scandir(dirfd) as entries:
+        fallback = None
+        for entry in entries:
+            if entry.name == name:
+                return name
+            if fallback is None:
+                try:
+                    if os.path.samestat(entry.stat(follow_symlinks=False), st):
+                        fallback = entry.name
+                except OSError:
+                    continue
+    return name if fallback is None else fallback
 
 
 def _rename_pin_file(ondisk, target, rename_ctx, roots):
@@ -1060,8 +1140,12 @@ def _rename_pin_file(ondisk, target, rename_ctx, roots):
     dirfd = _open_checked_dir(parent, roots)
     try:
         current_parent = _assert_dir_unmoved(dirfd, roots)
-        _rename_pin_at(dirfd, current_parent, os.path.basename(ondisk), target,
-                       rename_ctx)
+        # F_GETPATH liefert nur die Schreibweise des Verzeichnisses; der
+        # Dateiname kommt vom Aufrufer und kann auf APFS anders geschrieben
+        # sein als auf der Platte. Deshalb den gespeicherten Namen nachschlagen.
+        stored_name = _stored_name_at(dirfd, os.path.basename(ondisk))
+        _rename_pin_at(dirfd, current_parent, stored_name, target, rename_ctx,
+                       roots)
     finally:
         os.close(dirfd)
 
@@ -1112,14 +1196,10 @@ def _rename_pin_tree(dirfd, dirpath, target, rename_ctx, roots, skipped, counted
             elif entry.is_file(follow_symlinks=False):
                 counted[0] += 1
                 if validate_only:
-                    logical_name = (name[:-len(SUFFIX)]
-                                    if name.endswith(SUFFIX) else name)
-                    placeholder_name = logical_name + SUFFIX
-                    _validate_local_pin_at(
-                        dirfd, dirpath, logical_name, placeholder_name,
-                        rename_ctx)
+                    _validate_pin_at(dirfd, dirpath, name, target, rename_ctx)
                 else:
-                    _rename_pin_at(dirfd, dirpath, name, target, rename_ctx)
+                    _rename_pin_at(dirfd, dirpath, name, target, rename_ctx,
+                                   roots)
         except RuntimeError as exc:
             skipped.append(str(exc))
         except OSError as exc:
@@ -1147,23 +1227,23 @@ def rename_do_action(ondisk, target, rename_ctx, roots):
         # Rekursion nur noch relativ zu geöffneten Verzeichnissen weiter.
         dirfd = _open_checked_dir(ondisk, roots)
         try:
-            # Hydrierungen zuerst über den GESAMTEN Baum prüfen. Damit kann ein
-            # statisch veralteter Journal-Inode nicht erst nach bereits
-            # umbenannten Nachbardateien auffallen und einen halben Ordner
-            # hinterlassen. Direkt vor jedem echten Rename prüft
+            # Zuerst den GESAMTEN Baum prüfen, für Hydrierung UND Dehydrierung.
+            # Damit kann ein veralteter Journal-Inode oder eine noch nicht
+            # gesyncte Datei nicht erst nach bereits umbenannten Nachbardateien
+            # auffallen und einen halben Ordner hinterlassen (die READMEs
+            # versprechen genau das). Direkt vor jedem echten Rename prüft
             # _rename_pin_at() dieselben Bedingungen erneut gegen Dateirennen.
-            if target == "local":
-                preflight_skipped = []
-                preflight_counted = [0]
-                _rename_pin_tree(
-                    dirfd, ondisk, target, rename_ctx, roots,
-                    preflight_skipped, preflight_counted, validate_only=True)
-                if preflight_skipped:
-                    raise RuntimeError(
-                        "%d von %d Datei(en) vor dem ersten Rename abgelehnt — "
-                        "z.B.: %s"
-                        % (len(preflight_skipped), preflight_counted[0],
-                           preflight_skipped[0]))
+            preflight_skipped = []
+            preflight_counted = [0]
+            _rename_pin_tree(
+                dirfd, ondisk, target, rename_ctx, roots,
+                preflight_skipped, preflight_counted, validate_only=True)
+            if preflight_skipped:
+                raise RuntimeError(
+                    "%d von %d Datei(en) vor dem ersten Rename abgelehnt — "
+                    "z.B.: %s"
+                    % (len(preflight_skipped), preflight_counted[0],
+                       preflight_skipped[0]))
 
             skipped = []
             counted = [0]
@@ -1431,7 +1511,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.4")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.5")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)

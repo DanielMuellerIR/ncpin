@@ -112,8 +112,6 @@ for app in "$STAGE"/*.app(N); do
 done
 
 echo "=== 2/3 DMG packen ==="
-mkdir -p -- "$DIST"
-rm -f -- "$RW_DMG" "$PARTIAL_DMG"
 # Fail-closed statt detach -force: Haengt unter dem Mountpoint bereits ein
 # (moeglicherweise fremdes) Volume, wird es NICHT zwangsgetrennt — abbrechen
 # und dem Nutzer das Auswerfen ueberlassen. mount(8) zeigt aufgeloeste Pfade,

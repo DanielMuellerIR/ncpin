@@ -295,25 +295,54 @@ class RenameTransportRoundtripTests(unittest.TestCase):
             state = "unknown"
         return status_result(state)
 
-    def make_fake_run(self, op_effects):
+    def make_fake_run(self, op_effects, on_status=None,
+                      status_after_first=None):
         """Baut ein run_ncpin-Double.
 
         op_effects ist die erwartete Abfolge der MUTIERENDEN Aufrufe als Liste
         von (verb, seiteneffekt, rc); status-Aufrufe lesen den echten
-        Temp-Dateizustand.
+        Temp-Dateizustand. Gibt ein Seiteneffekt eine Zahl zurueck, ersetzt sie
+        den geplanten rc (so kann ein Double die Ablehnung der echten CLI
+        nachbilden). ``on_status`` laeuft vor jedem Statusaufruf (simuliert
+        den Client, der im Hintergrund weiterarbeitet). ``status_after_first``
+        laesst jeden Statusaufruf nach dem ersten fest diesen Zustand melden.
         """
+        status_calls = [0]
+
         def fake_run(runner, args):
             verb = args[0]
             self.verbs.append(verb)
             if verb == "status":
+                status_calls[0] += 1
+                if on_status is not None:
+                    on_status(status_calls[0])
+                if status_after_first is not None and status_calls[0] > 1:
+                    return status_result(status_after_first)
                 return self.fs_status_result()
             self.assertTrue(op_effects,
                             "unerwarteter Mutationsaufruf: %s" % verb)
             expected_verb, effect, rc = op_effects.pop(0)
             self.assertEqual(verb, expected_verb)
-            effect()
+            override = effect()
+            if override is not None:
+                rc = override
             return (0.2, rc, "", "" if rc == 0 else "Timeout")
         return fake_run
+
+    def cli_like_local(self):
+        """Seiteneffekt, der ``ncpin local`` treu nachbildet.
+
+        Die echte CLI hydriert nur einen 1-Byte-Platzhalter mit virtuellem
+        Journal-Eintrag. Eine suffigierte Datei mit vollem Inhalt lehnt sie ab
+        (Exit 1) und laesst sie unveraendert liegen.
+        """
+        if os.path.exists(self.placeholder):
+            if os.stat(self.placeholder).st_size != 1:
+                return 1
+            os.rename(self.placeholder, self.logical)
+            with open(self.logical, "wb") as handle:
+                handle.write(b"voller inhalt")
+        return 0
 
     def test_pending_download_stub_is_reverted_not_false_verified(self):
         # Wait-Timeout nach dem Download-Rename: Der 1-Byte-Stub liegt schon
@@ -384,35 +413,70 @@ class RenameTransportRoundtripTests(unittest.TestCase):
                          ["status", "local", "status", "status",
                           "online", "status", "status"])
 
-    def test_pending_dehydration_rename_is_rolled_back_despite_unknown_state(self):
+    def test_pending_dehydration_waits_for_the_client_then_rehydrates(self):
         # Wait-Timeout nach dem Dehydrierungs-Rename: Die Suffixdatei traegt
-        # noch den vollen Inhalt und meldet "unknown". Frueher wurde die
-        # Wiederherstellung dann komplett uebersprungen; jetzt wird die
-        # Umbenennung anhand des Pfads zurueckgenommen.
+        # noch den vollen Inhalt und meldet "unknown". ``ncpin local`` lehnt
+        # diesen Zwischenstand ab (kein Platzhalter im Journal). Der Bench muss
+        # deshalb warten, bis der Client die Dehydrierung abgeschlossen hat
+        # (1-Byte-Platzhalter, "online"), und erst DANN per local zurueck.
         with open(self.logical, "wb") as handle:
             handle.write(b"voller inhalt")
 
         def dehydrate_rename_only():
             os.rename(self.logical, self.placeholder)  # Inhalt bleibt voll
 
-        def undo_rename():
-            os.rename(self.placeholder, self.logical)
+        def client_finishes_dehydration_late(status_call):
+            # Der Client kommt erst beim 5. Statusaufruf zum Zug.
+            if status_call >= 5 and os.path.exists(self.placeholder):
+                with open(self.placeholder, "wb") as handle:
+                    handle.write(b" ")
 
         effects = [("online", dehydrate_rename_only, 1),
-                   ("local", undo_rename, 0)]
-        with mock.patch.object(self.bench, "run_ncpin",
-                               side_effect=self.make_fake_run(effects)):
+                   ("local", self.cli_like_local, 0)]
+        with mock.patch.object(
+                self.bench, "run_ncpin",
+                side_effect=self.make_fake_run(
+                    effects, on_status=client_finishes_dehydration_late)):
             result = self.bench.roundtrip(["runner"], self.logical, 5.0)
 
         self.assertFalse(result["ok"])
-        self.assertTrue(result["restore_verified"])
+        self.assertTrue(result["restore_verified"], result)
         self.assertEqual(effects, [])
         self.assertFalse(os.path.exists(self.placeholder))
         with open(self.logical, "rb") as handle:
             self.assertEqual(handle.read(), b"voller inhalt")
+        # status(Anfang), online, status(Ergebnis), status(Restore-Lesung),
+        # dann Warten auf "online" (2 Polls), local, status, status.
         self.assertEqual(self.verbs,
                          ["status", "online", "status", "status",
-                          "local", "status", "status"])
+                          "status", "status", "local", "status", "status"])
+        waited = [s for s in result["steps"] if s.get("waited_only")]
+        self.assertEqual(len(waited), 1)
+        self.assertTrue(waited[0]["reached"])
+
+    def test_pending_dehydration_never_finishing_is_not_reported_restored(self):
+        # Bleibt die Suffixdatei mit vollem Inhalt liegen, gibt es keinen
+        # sicheren Rueckweg: local darf nicht mit einer Datei beauftragt
+        # werden, die die CLI ohnehin ablehnt, und die Wiederherstellung gilt
+        # als NICHT erledigt (Fehler im Ergebnis), statt still als gruen.
+        with open(self.logical, "wb") as handle:
+            handle.write(b"voller inhalt")
+
+        def dehydrate_rename_only():
+            os.rename(self.logical, self.placeholder)
+
+        effects = [("online", dehydrate_rename_only, 1)]
+        with mock.patch.object(self.bench, "run_ncpin",
+                               side_effect=self.make_fake_run(effects)):
+            result = self.bench.roundtrip(["runner"], self.logical, 0.2)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["restore_verified"])
+        self.assertIn("Dehydrierung nicht abgeschlossen", result["error"])
+        self.assertNotIn("local", self.verbs)
+        self.assertTrue(os.path.exists(self.placeholder))
+        with open(self.placeholder, "rb") as handle:
+            self.assertEqual(handle.read(), b"voller inhalt")
 
     def test_reassert_initial_state_detects_ondisk_mismatch_with_real_files(self):
         with open(self.logical, "wb") as handle:
@@ -441,21 +505,28 @@ class RenameTransportRoundtripTests(unittest.TestCase):
         self.assertFalse(result["restore_verified"])
 
     def test_persistent_unknown_state_attempts_reassertion(self):
+        # Nach dem fehlgeschlagenen Hin-Befehl meldet JEDER weitere Statusaufruf
+        # "unknown" (z.B. JSON-/Exit-Code-Fehler der CLI). Der Bench muss den
+        # Ausgangszustand 'local' trotzdem aktiv beauftragen, darf die
+        # Wiederherstellung aber NICHT bestaetigen und setzt den Fehler.
         with open(self.logical, "wb") as handle:
             handle.write(b"voller inhalt")
 
         def fail_online():
             pass
 
-        # Bei persistentem unknown wird trotzdem der Ausgangszustand 'local' beauftragt
         effects = [("online", fail_online, 1),
                    ("local", lambda: None, 0)]
-        with mock.patch.object(self.bench, "run_ncpin",
-                               side_effect=self.make_fake_run(effects)):
+        with mock.patch.object(
+                self.bench, "run_ncpin",
+                side_effect=self.make_fake_run(effects,
+                                               status_after_first="unknown")):
             result = self.bench.roundtrip(["runner"], self.logical, 5.0)
 
         self.assertFalse(result["ok"])
-        self.assertTrue(result["restore_verified"])
+        self.assertIn("local", self.verbs)
+        self.assertFalse(result["restore_verified"])
+        self.assertIn("unbekannt", result["error"])
         self.assertEqual(self.verbs,
                          ["status", "online", "status", "status",
                           "local", "status"])

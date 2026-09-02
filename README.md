@@ -234,8 +234,9 @@ for suffix mode ([discovery.cpp](https://github.com/nextcloud/desktop/blob/stabl
   1 byte (the same heuristic the engine itself uses);
 - **sync roots:** taken from the client's `nextcloud.cfg` (folders with `virtualFilesMode=suffix`);
   the same path-boundary checks apply as with the socket transport;
-- **folders:** recursed by ncpin itself. Hydration preflights the complete tree before the first
-  rename, so one stale journal entry cannot leave an intentionally half-hydrated folder.
+- **folders:** recursed by ncpin itself. Both hydration and dehydration preflight the complete
+  tree before the first rename, so one stale journal entry or one not-yet-synced file cannot leave
+  an intentionally half-converted folder.
 
 Edge case inherited from the engine: a genuine 1-byte file is indistinguishable from a fresh
 placeholder and reports as `online`.

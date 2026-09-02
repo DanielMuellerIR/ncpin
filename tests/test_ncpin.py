@@ -943,6 +943,110 @@ class RenameTransportTests(unittest.TestCase):
             os.path.join(moved, "datei.txt") + self.ncpin.SUFFIX))
         self.assertFalse(os.path.exists(os.path.join(moved, "datei.txt")))
 
+    def _run_with_folder_moved_during_journal_load(self, target, rel_path):
+        """Verschiebt den Elternordner WAEHREND des Journal-Ladens nach draussen.
+
+        Das Journal wird erst nach dem Oeffnen des Verzeichnis-fds geladen (Klon
+        + SQLite-Lesen). Ein Verschieben in genau diesem Fenster laesst den
+        Deskriptor an seiner Inode haengen, die jetzt ausserhalb der Wurzel
+        liegt. Ohne erneute Pruefung direkt vor dem Rename wuerde ncpin dort
+        draussen umbenennen.
+        """
+        folder = os.path.join(self.root, "ordner")
+        moved = os.path.join(self.outside, "verschoben")
+        original_load = self.ncpin._load_journal_entries
+
+        def load_then_move(journal_folder):
+            entries = original_load(journal_folder)
+            os.rename(folder, moved)
+            return entries
+
+        with mock.patch.object(self.ncpin, "_load_journal_entries",
+                               side_effect=load_then_move):
+            rc, _out, _err = self.run_cli(target, os.path.join(folder, rel_path))
+        return rc, moved
+
+    def test_folder_moved_after_journal_check_blocks_hydration_rename(self):
+        # Direkte Dateiaktion: Grenzpruefung, dann Journal-Klon, dann Rename.
+        # Wird der geoeffnete Ordner zwischen Journalpruefung und Rename aus
+        # der Syncwurzel geschoben, muss der Rename mit Exit 3 unterbleiben.
+        self.make_placeholder("ordner/datei.txt")
+
+        rc, moved = self._run_with_folder_moved_during_journal_load(
+            "local", "datei.txt")
+
+        self.assertEqual(rc, 3)
+        self.assertTrue(os.path.exists(
+            os.path.join(moved, "datei.txt") + self.ncpin.SUFFIX))
+        self.assertFalse(os.path.exists(os.path.join(moved, "datei.txt")))
+
+    def test_folder_moved_after_journal_check_blocks_dehydration_rename(self):
+        # Dasselbe Fenster fuer die Gegenrichtung: _require_synced laedt das
+        # Journal, danach darf ohne erneute Grenzpruefung kein Rename folgen.
+        self.make_file("ordner/datei.txt", b"voller inhalt")
+
+        rc, moved = self._run_with_folder_moved_during_journal_load(
+            "online", "datei.txt")
+
+        self.assertEqual(rc, 3)
+        self.assertTrue(os.path.exists(os.path.join(moved, "datei.txt")))
+        self.assertFalse(os.path.exists(
+            os.path.join(moved, "datei.txt") + self.ncpin.SUFFIX))
+
+    def _skip_unless_case_insensitive(self):
+        probe = os.path.join(self.tmp.name, "CaseProbe")
+        with open(probe, "wb") as handle:
+            handle.write(b"x")
+        if not os.path.exists(os.path.join(self.tmp.name, "caseprobe")):
+            self.skipTest("Dateisystem ist case-sensitive")
+
+    def test_case_variant_file_name_hydrates_the_stored_placeholder(self):
+        # Direkte Dateiaktion mit anders geschriebenem DATEInamen: Der Kernel
+        # findet CaseName.txt.nextcloud auch ueber CASENAME.TXT, der
+        # Journalabgleich braucht aber die gespeicherte Schreibweise. Vorher
+        # endete das mit Exit 1 ("nicht im Sync-Journal").
+        self._skip_unless_case_insensitive()
+        placeholder = self.make_placeholder("CaseName.txt")
+        variant = os.path.join(self.root, "CASENAME.TXT")
+
+        rc, _out, err = self.run_cli("local", variant)
+
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(placeholder))
+        self.assertIn("CaseName.txt", os.listdir(self.root))
+
+    def test_case_variant_file_name_dehydrates_the_stored_file(self):
+        self._skip_unless_case_insensitive()
+        stored = self.make_file("CaseName.txt", b"voller inhalt")
+        variant = os.path.join(self.root, "casename.txt")
+
+        rc, _out, err = self.run_cli("online", variant)
+
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(stored))
+        self.assertIn("CaseName.txt" + self.ncpin.SUFFIX, os.listdir(self.root))
+
+    def test_dehydrating_a_folder_preflights_every_file_before_the_first_rename(self):
+        # Die READMEs versprechen: Bei einer Journalabweichung bricht ncpin ab,
+        # BEVOR es im Ordner die erste Datei umbenennt — auch bei Dehydrierung.
+        # Die erste Datei ist sauber gesynct, die zweite wurde nach dem
+        # Journal-Eintrag geaendert. Ohne Vorpruefung waere die erste schon
+        # suffigiert, wenn die zweite abgelehnt wird.
+        first = self.make_file("ordner/a-sauber.txt", b"sauber")
+        second = self.make_file("ordner/b-geaendert.txt", b"alt")
+        with open(second, "wb") as handle:
+            handle.write(b"neuer, laengerer inhalt")
+        folder = os.path.join(self.root, "ordner")
+
+        rc, out, _err = self.run_cli("online", "--json", folder)
+
+        self.assertEqual(rc, 1)
+        self.assertIn("vor dem ersten Rename abgelehnt",
+                      json.loads(out)[0]["error"])
+        self.assertTrue(os.path.exists(first))
+        self.assertFalse(os.path.exists(first + self.ncpin.SUFFIX))
+        self.assertTrue(os.path.exists(second))
+
     def test_umlaut_folder_in_the_other_unicode_form_still_renames(self):
         # APFS speichert einen Namen so, wie er angelegt wurde, findet ihn aber
         # auch in der anderen Unicode-Normalform. Der Kernel meldet den
@@ -1006,17 +1110,46 @@ class RenameTransportTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("keine regulären Dateien", json.loads(out)[0]["error"])
 
-    def test_folder_scan_cap_bounds_non_regular_entries(self):
-        # FOLDER_SCAN_CAP muss alle Eintraege begrenzen, nicht nur regulaere Dateien.
+    def test_folder_scan_cap_bounds_consumed_directory_entries(self):
+        # FOLDER_SCAN_CAP muss die GELESENEN Verzeichniseintraege begrenzen,
+        # nicht nur nachgelagerte stat-Aufrufe: os.walk haette den kompletten
+        # Ordner materialisiert, bevor die Schleife am Deckel abbricht. Gezaehlt
+        # wird deshalb, wie viele Eintraege der scandir-Iterator herausgibt.
         folder = os.path.join(self.root, "viele_links")
         os.makedirs(folder)
-        for i in range(self.ncpin.FOLDER_SCAN_CAP + 20):
+        for i in range(self.ncpin.FOLDER_SCAN_CAP + 100):
             os.symlink("/nonexistent", os.path.join(folder, "link_%d" % i))
+        consumed = [0]
+        real_scandir = os.scandir
 
-        with mock.patch("os.lstat", wraps=os.lstat) as lstat_spy:
+        class CountingScandir(object):
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                consumed[0] += 1
+                return next(self.inner)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                self.inner.close()
+
+            def close(self):
+                self.inner.close()
+
+        with mock.patch("os.scandir",
+                        side_effect=lambda *a, **k:
+                        CountingScandir(real_scandir(*a, **k))):
             state = self.ncpin.fs_folder_state(folder, exact=False)
-            self.assertEqual(state, "unknown")
-            self.assertLessEqual(lstat_spy.call_count, self.ncpin.FOLDER_SCAN_CAP)
+
+        self.assertEqual(state, "unknown")
+        # +1: Der Eintrag, an dem der Deckel greift, wurde bereits gelesen.
+        self.assertLessEqual(consumed[0], self.ncpin.FOLDER_SCAN_CAP + 1)
 
     def test_folder_state_ignores_symlink_to_a_file_outside_the_root(self):
         # Der Aktionspfad ueberspringt Symlinks; der Zustandsleser muss das auch
@@ -1052,7 +1185,9 @@ class RenameTransportTests(unittest.TestCase):
             os.chmod(folder, 0o755)
 
         self.assertEqual(rc, 1)
-        self.assertIn("übersprungen", json.loads(out)[0]["error"])
+        # Die Ordner-Vorpruefung meldet den Fehler schon vor dem ersten Rename.
+        self.assertIn("vor dem ersten Rename abgelehnt",
+                      json.loads(out)[0]["error"])
         self.assertTrue(os.path.exists(os.path.join(folder, "inhalt.txt")))
 
     def test_folder_action_reports_failed_rename_instead_of_swallowing_it(self):

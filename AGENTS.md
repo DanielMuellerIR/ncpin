@@ -79,7 +79,16 @@ Dehydrierung. Verträge dieses Transports:
   mtime zum Sync-Journal passen, und ignoriert sie sonst still. ncpin prüft
   das vorher gegen einen APFS-Klon des Journals (`cp -c`; der laufende Client
   sperrt die SQLite mit `locking_mode=EXCLUSIVE`, Direktlesen scheitert) und
-  lehnt sonst mit klarem Fehler ab. Nie ungeprüft umbenennen.
+  lehnt sonst mit klarem Fehler ab; Ordner werden auch hier vollständig
+  vorgeprüft, bevor die erste Datei umbenannt wird. Nie ungeprüft umbenennen.
+- Zwischen Journalprüfung und Rename vergeht Zeit (Journal-Klon). Der
+  Verzeichnis-Deskriptor hängt an der Inode, nicht am Pfad: `_assert_dir_unmoved`
+  läuft deshalb unmittelbar vor **jedem** `_rename_excl_at` erneut, nicht nur
+  beim Betreten des Verzeichnisses.
+- Bei direkten Dateiaktionen kommt der Dateiname vom Aufrufer und kann auf
+  case-insensitivem APFS anders geschrieben sein als gespeichert.
+  `_stored_name_at` schlägt den gespeicherten Namen fd-relativ nach; Suffix,
+  Journalpfad und Rename arbeiten nur damit.
 - Umbenennungen sind fire-and-forget wie MAKE-Befehle; den Sync stößt der
   Dateiwächter des Clients an. `--wait` pollt den Dateisystem-Zustand.
 - Ordner rekursiert ncpin selbst (der Client übernahm das früher); Symlinks

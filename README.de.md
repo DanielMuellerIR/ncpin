@@ -239,9 +239,9 @@ suffix-Modus eingebaut hat ([discovery.cpp](https://github.com/nextcloud/desktop
   1 Byte (dieselbe Heuristik verwendet die Engine selbst);
 - **Syncwurzeln:** aus der `nextcloud.cfg` des Clients (Ordner mit `virtualFilesMode=suffix`);
   es gelten dieselben Pfadgrenzen-Prüfungen wie beim Socket-Transport;
-- **Ordner:** rekursiert ncpin selbst. Vor einer Hydrierung prüft es den gesamten Baum, bevor es
-  die erste Datei umbenennt; ein veralteter Journal-Eintrag hinterlässt damit keinen absichtlich
-  halb hydrierten Ordner.
+- **Ordner:** rekursiert ncpin selbst. Vor einer Hydrierung wie vor einer Dehydrierung prüft es
+  den gesamten Baum, bevor es die erste Datei umbenennt; ein veralteter Journal-Eintrag oder eine
+  noch nicht gesyncte Datei hinterlässt damit keinen absichtlich halb umgestellten Ordner.
 
 Von der Engine geerbter Grenzfall: Eine echte 1-Byte-Datei ist von einem frischen Platzhalter
 nicht unterscheidbar und wird als `online` gemeldet.

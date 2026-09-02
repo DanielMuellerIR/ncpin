@@ -391,6 +391,22 @@ def _reassert_initial_state(runner, sample, timeout, initial_state,
     return restored
 
 
+def _wait_for_state(runner, sample, wanted, timeout):
+    """Pollt den Zustand nur lesend, bis ``wanted`` erreicht ist oder Zeit ablaeuft.
+
+    Liefert (erreicht, letzter Zustand, letzte Messwerte). Es wird immer
+    mindestens einmal gelesen.
+    """
+    deadline = time.time() + timeout
+    while True:
+        state, probe = read_status_state(runner, sample)
+        if state == wanted:
+            return True, state, probe
+        if time.time() >= deadline:
+            return False, state, probe
+        time.sleep(SETTLE_PAUSE)
+
+
 def _revert_pending_transition(runner, sample, timeout, initial_state,
                                initial_ondisk, result, current_state=None):
     """Nimmt einen ausstehenden Rename-Uebergang transportgerecht zurueck.
@@ -403,14 +419,42 @@ def _revert_pending_transition(runner, sample, timeout, initial_state,
         wieder dehydrieren ("online"). Ist die Datei ausweislich
         ``current_state`` schon fertig hydriert, entfaellt dieser Schritt:
         Er waere ein wirkungsloser zweiter CLI-Aufruf.
-      - Anfangs lokal, jetzt suffigiert: Die Rueck-Umbenennung ("local")
-        genuegt; der Inhalt liegt noch (oder wieder) vor.
+      - Anfangs lokal, jetzt suffigiert: Die Datei traegt noch ihren vollen
+        Inhalt, bis der Client sie dehydriert. ``ncpin local`` lehnt diesen
+        Zwischenstand ab — kein virtueller Journal-Eintrag, kein
+        1-Byte-Platzhalter —, und ein direktes Zurueckbenennen am Journal
+        vorbei ist genau der ungeprüfte Rename, den die CLI verhindert. Also
+        erst die ausstehende Dehydrierung abwarten (Zustand "online"), dann
+        per "local" wieder herunterladen. Kommt der Client nicht zum Zug,
+        gilt die Wiederherstellung als NICHT erledigt (Fehler im Ergebnis).
     Gibt True nur zurueck, wenn am Ende Zustand UND Pfad dem Anfang
     entsprechen.
     """
     if initial_ondisk.endswith(SUFFIX):
         plan = ["online"] if current_state == "local" else ["local", "online"]
     else:
+        if current_state != "online":
+            reached, observed, probe = _wait_for_state(
+                runner, sample, "online", timeout)
+            result["steps"].append({
+                "target": "online",
+                "elapsed_ms": probe["elapsed_ms"],
+                "reached": reached,
+                "rc": None,          # nur beobachtet, kein CLI-Befehl gesendet
+                "stdout": "",
+                "stderr": probe["stderr"],
+                "observed_state": observed,
+                "restoration": True,
+                "waited_only": True,
+            })
+            if not reached:
+                result["error"] = (
+                    "Ausstehende Dehydrierung nicht abgeschlossen — "
+                    "Rueckweg per 'local' nicht sicher moeglich; Fixture "
+                    "liegt noch suffigiert mit vollem Inhalt vor.")
+                result["final_probe"] = probe
+                result["final_ondisk"] = _ondisk_representation(sample)
+                return False
         plan = ["local"]
     for step_target in plan:
         dt, rc, out, err = run_ncpin(
@@ -484,8 +528,6 @@ def roundtrip(runner, sample, timeout):
                     current_state, restore_probe, current_ondisk)
         result["restore_probe"] = restore_probe
         result["restore_ondisk"] = current_ondisk
-        path_stable = (initial_ondisk is None
-                       or current_ondisk == initial_ondisk)
         if (initial_ondisk is not None and current_ondisk is not None
                 and current_ondisk != initial_ondisk):
             # Der Pfadname weicht ab -> ein Rename-Uebergang steht noch aus,
