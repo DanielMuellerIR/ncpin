@@ -39,6 +39,7 @@ class FakeNextcloudSocket:
         self.socket_path = socket_path
         self.roots = roots
         self.handshake_chunks = handshake_chunks
+        self.menu_chunks = None
         self.commands = []
         self._stop = threading.Event()
         self._ready = threading.Event()
@@ -97,11 +98,17 @@ class FakeNextcloudSocket:
                     command = data.decode("utf-8", "replace").strip()
                     self.commands.append(command)
                     if command.startswith("GET_MENU_ITEMS:"):
-                        conn.sendall(
+                        chunks = self.menu_chunks or [
                             b"MENU_ITEM:MAKE_AVAILABLE_LOCALLY:d:Lokal\n"
                             b"MENU_ITEM:MAKE_ONLINE_ONLY::Online\n"
                             b"GET_MENU_ITEMS:END\n"
-                        )
+                        ]
+                        try:
+                            for chunk in chunks:
+                                conn.sendall(chunk)
+                                time.sleep(0.02)
+                        except BrokenPipeError:
+                            pass
         finally:
             server.close()
             try:
@@ -393,6 +400,49 @@ class PathBoundaryTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             rc = self.ncpin.main(list(args) + ["--socket", self.socket_path])
         return rc, stdout.getvalue(), stderr.getvalue()
+
+    def protocol_fixture(self):
+        path = os.path.join(self.root, "fixture.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("fixture")
+        return path
+
+    def test_fragmented_menu_response_including_utf8_and_end_marker(self):
+        path = self.protocol_fixture()
+        response = ("MENU_ITEM:OTHER::Zusätzlich\n"
+                    "MENU_ITEM:MAKE_AVAILABLE_LOCALLY:d:Lokal\n"
+                    "MENU_ITEM:MAKE_ONLINE_ONLY::Online\n"
+                    "GET_MENU_ITEMS:END\n").encode("utf-8")
+        split = response.index("ä".encode("utf-8")) + 1
+        self.server.menu_chunks = [response[:split], response[split:65],
+                                   response[65:-3], response[-3:]]
+        rc, out, err = self.run_cli("status", "--json", path)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(json.loads(out)[0]["state"], "local")
+
+    def test_unknown_toggle_sends_no_make_command(self):
+        path = self.protocol_fixture()
+        self.server.menu_chunks = [b"MENU_ITEM:OTHER::Other\nGET_MENU_ITEMS:END\n"]
+        rc, out, _err = self.run_cli("toggle", "--json", path)
+        self.assertEqual(rc, 1)
+        self.assertIn("toggle abgebrochen", json.loads(out)[0]["error"])
+        self.assertFalse(any(cmd.startswith("MAKE_") for cmd in self.server.commands))
+
+    def test_wait_times_out_after_make_without_state_change(self):
+        path = self.protocol_fixture()
+        started = time.monotonic()
+        rc, out, _err = self.run_cli("online", "--wait", "--timeout", "0.2",
+                                     "--json", path)
+        elapsed = time.monotonic() - started
+        self.assertEqual(rc, 1)
+        result = json.loads(out)[0]
+        self.assertTrue(result["waited"])
+        self.assertFalse(result["reached"])
+        self.assertGreaterEqual(elapsed, 0.2)
+        self.assertLess(elapsed, 3)
+        self.assertIn("MAKE_ONLINE_ONLY:" + os.path.realpath(path), self.server.commands)
+        self.assertTrue(any(cmd.startswith("GET_MENU_ITEMS:")
+                            for cmd in self.server.commands))
 
     def test_mutation_rejects_symlink_escape_without_make_command(self):
         outside_file = os.path.join(self.outside, "fremd.txt")

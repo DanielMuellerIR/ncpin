@@ -318,7 +318,68 @@ if [ "$STAGE_ONLY" -eq 0 ]; then
 fi
 
 BUILD="$(mktemp -d "${TMPDIR:-/tmp}/ncpin-install.XXXXXX")"
-trap 'rm -rf -- "$BUILD"' EXIT
+typeset -a TX_DEST TX_STAGE TX_NEW_ID TX_OLD_ID
+TX_COMMITTED=0
+
+artifact_identity() {
+	/usr/bin/stat -f '%d:%i' "$1" 2>/dev/null || true
+}
+
+remember_swap() {
+	TX_DEST+=("$1")
+	TX_STAGE+=("$2")
+	TX_NEW_ID+=("$(artifact_identity "$1")")
+	TX_OLD_ID+=("$(artifact_identity "$2")")
+}
+
+finish_install() {
+	local result=$? index destination stage new_id old_id
+	trap - EXIT ZERR
+	# Auch exit aus einer spaeten Kollisionspruefung muss fruehere Ziele
+	# zurueckrollen. Fremde Ersetzungen inzwischen nicht ueberschreiben.
+	for (( index=${#TX_DEST}; index>=1; index-- )); do
+		destination="${TX_DEST[$index]}"
+		stage="${TX_STAGE[$index]}"
+		new_id="${TX_NEW_ID[$index]}"
+		old_id="${TX_OLD_ID[$index]}"
+		if [ "$TX_COMMITTED" -eq 1 ]; then
+			if [ -n "$old_id" ] && [ "$(artifact_identity "$stage")" = "$old_id" ]; then
+				remove_stage "$stage" || result=1
+			fi
+			continue
+		fi
+		if [ -z "$new_id" ] || [ "$(artifact_identity "$destination")" != "$new_id" ] \
+				|| [ "$(artifact_identity "$stage")" != "$old_id" ]; then
+			print -u2 -- "FEHLER: Rollback durch veraendertes Ziel blockiert: $destination; Altstand: $stage"
+			result=1
+			continue
+		fi
+		if [ -n "$old_id" ]; then
+			if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$destination" "$stage"; then
+				print -u2 -- "FEHLER: Rollback fehlgeschlagen: $destination; Altstand: $stage"
+				result=1
+				continue
+			fi
+			# Ein zweiter Austausch waehrend des Ruecktauschs darf kein
+			# fremdes Artefakt in der anschliessenden Bereinigung vernichten.
+			if [ "$(artifact_identity "$stage")" != "$new_id" ]; then
+				print -u2 -- "FEHLER: Fremdes Artefakt beim Rollback erhalten: $stage"
+				result=1
+				continue
+			fi
+			remove_stage "$stage" || result=1
+		else
+			remove_stage "$destination" || result=1
+		fi
+	done
+	rm -rf -- "$BUILD"
+	exit "$result"
+}
+# zsh fuehrt EXIT bei errexit aus einer Funktion nicht automatisch aus.
+# ZERR sorgt auch dort fuer die gemeinsame Rueckabwicklung.
+trap finish_install EXIT ZERR
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
 BUILD_APPS="$BUILD/apps"
 BUILD_SERVICES="$BUILD/services"
 mkdir -p "$BUILD_APPS" "$BUILD_SERVICES"
@@ -507,19 +568,22 @@ install_tree() {
 	assert_replaceable_tree "$destination" "$owner"
 	parent="$(dirname "$destination")"
 	stage="$(mktemp -d "$parent/.ncpin-stage.XXXXXX")"
-	/usr/bin/ditto "$source" "$stage"
+	if ! /usr/bin/ditto "$source" "$stage"; then
+		remove_stage "$stage"
+		return 1
+	fi
 	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
 		remove_stage "$stage"
 		return 1
 	fi
-	# Bei einem Swap liegt der alte Stand jetzt am Stage-Pfad — nur ein als
-	# ncpin-eigen markierter darf hier geloescht werden.
+	# Bei einem Swap liegt der alte Stand jetzt am Stage-Pfad. Ohne --force
+	# einen fremden Stand sofort zuruecklegen, eigene Altstaende behalten.
 	if [ "$FORCE" -eq 0 ] && path_exists "$stage" \
 			&& ! is_owned_tree "$stage" "$owner"; then
 		rollback_foreign_swapout "$stage" "$destination" "$owner"
 		return 1
 	fi
-	remove_stage "$stage"
+	remember_swap "$destination" "$stage"
 }
 
 install_link() {
@@ -540,7 +604,7 @@ install_link() {
 		rollback_foreign_swapout "$stage" "$destination"
 		return 1
 	fi
-	remove_stage "$stage"
+	remember_swap "$destination" "$stage"
 }
 
 install_tree "$BUILT_APP1" "$APP1" "$BUNDLE_BASE.local"
@@ -561,6 +625,8 @@ if [ "${NCPIN_SKIP_REGISTRATION:-0}" != "1" ]; then
 	/System/Library/CoreServices/pbs -update 2>/dev/null || true
 	killall Dock 2>/dev/null || true
 fi
+
+TX_COMMITTED=1
 
 case ":$PATH:" in
 	*":$LINKDIR:"*) ;;

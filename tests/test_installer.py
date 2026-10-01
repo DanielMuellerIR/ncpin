@@ -582,6 +582,188 @@ class InstallerTest(unittest.TestCase):
             [name for name in os.listdir(self.apps)
              if name.startswith(".ncpin-stage")], [])
 
+    def install_targets(self):
+        return [self.app(), self.app("Speicher freigeben.app"),
+                self.workflow(), self.workflow("Speicher freigeben (Nextcloud).workflow"),
+                os.path.join(self.links, "ncpin")]
+
+    def inject_swap_failure(self, position):
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1:]\n"
+                "if destination == %r:\n"
+                "    sys.exit(42)\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                % (os.path.join(REPO, "tools"), self.install_targets()[position]))
+
+    def assert_no_stages(self):
+        for directory in (self.apps, self.services, self.links):
+            self.assertEqual([name for name in os.listdir(directory)
+                              if name.startswith(".ncpin-stage")], [])
+
+    def test_failed_first_install_rolls_back_at_every_target(self):
+        for position in range(5):
+            with self.subTest(position=position + 1):
+                self.inject_swap_failure(position)
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                for target in self.install_targets():
+                    self.assertFalse(os.path.lexists(target), target)
+                self.assert_no_stages()
+
+    def test_failed_update_restores_every_old_target_and_inode(self):
+        self.install_ok()
+        targets = self.install_targets()
+        original_inodes = [os.lstat(target).st_ino for target in targets]
+        for target in targets[:-1]:
+            with open(os.path.join(target, "old-data"), "w") as handle:
+                handle.write("Altstand")
+        for position in range(5):
+            with self.subTest(position=position + 1):
+                self.inject_swap_failure(position)
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertEqual([os.lstat(target).st_ino for target in targets],
+                                 original_inodes)
+                for target in targets[:-1]:
+                    with open(os.path.join(target, "old-data")) as handle:
+                        self.assertEqual(handle.read(), "Altstand")
+                self.assert_no_stages()
+
+    def test_late_collision_restores_previous_targets(self):
+        self.install_ok()
+        first_inode = os.lstat(self.app()).st_ino
+        # Erst nach dem globalen Preflight entsteht eine fremde zweite App.
+        helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+        with open(helper, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import os, shutil, sys\n"
+                "sys.path.insert(0, %r)\n"
+                "import atomic_replace\n"
+                "source, destination = sys.argv[1:]\n"
+                "atomic_replace.atomic_replace(source, destination)\n"
+                "if destination == %r:\n"
+                "    shutil.rmtree(%r)\n"
+                "    os.mkdir(%r)\n"
+                "    open(os.path.join(%r, 'foreign-data'), 'w').close()\n"
+                % (os.path.join(REPO, "tools"), self.app(),
+                   self.app("Speicher freigeben.app"),
+                   self.app("Speicher freigeben.app"),
+                   self.app("Speicher freigeben.app")))
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Kollision", result.stderr)
+        self.assertEqual(os.lstat(self.app()).st_ino, first_inode)
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.app("Speicher freigeben.app"), "foreign-data")))
+        self.assert_no_stages()
+
+    def test_registration_failure_restores_all_five_targets(self):
+        self.install_ok()
+        targets = self.install_targets()
+        original_inodes = [os.lstat(target).st_ino for target in targets]
+        registrar = os.path.join(self.root, "failed-registration")
+        self.fake_command(self.root, "failed-registration", 42)
+        installer = os.path.join(self.copy, "install.sh")
+        with open(installer, encoding="utf-8") as handle:
+            text = handle.read()
+        original = ('LSREG="/System/Library/Frameworks/CoreServices.framework/'
+                    'Frameworks/LaunchServices.framework/Support/lsregister"')
+        self.assertIn(original, text)
+        with open(installer, "w", encoding="utf-8") as handle:
+            handle.write(text.replace(original, 'LSREG="%s"' % registrar))
+        env = self.env.copy()
+        env["NCPIN_SKIP_REGISTRATION"] = "0"
+        result = self.run_installer(env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([os.lstat(target).st_ino for target in targets],
+                         original_inodes)
+        self.assert_no_stages()
+
+    def test_force_failure_restores_foreign_originals(self):
+        targets = self.install_targets()
+        for target in targets[:-1]:
+            os.mkdir(target)
+            with open(os.path.join(target, "foreign-data"), "w") as handle:
+                handle.write("Original")
+        os.symlink("/bin/sh", targets[-1])
+        inodes = [os.lstat(target).st_ino for target in targets]
+        self.inject_swap_failure(4)
+        result = self.run_installer("--force")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual([os.lstat(target).st_ino for target in targets], inodes)
+        for target in targets[:-1]:
+            with open(os.path.join(target, "foreign-data")) as handle:
+                self.assertEqual(handle.read(), "Original")
+        self.assert_no_stages()
+
+    def test_blocked_rollback_preserves_backup_and_reports_its_path(self):
+        for changed_target in (False, True):
+            with self.subTest(changed_target=changed_target):
+                helper = os.path.join(self.copy, "tools", "atomic_replace.py")
+                shutil.copy2(os.path.join(REPO, "tools", "atomic_replace.py"), helper)
+                self.install_ok()
+                with open(os.path.join(self.app(), "old-data"), "w") as handle:
+                    handle.write("Original")
+                old_inode = os.lstat(self.app()).st_ino
+                with open(helper, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        "import os, shutil, sys\n"
+                        "sys.path.insert(0, %r)\n"
+                        "import atomic_replace\n"
+                        "source, destination = sys.argv[1:]\n"
+                        "if destination == %r:\n"
+                        "    if %r:\n"
+                        "        shutil.rmtree(%r)\n"
+                        "        os.mkdir(%r)\n"
+                        "        open(os.path.join(%r, 'foreign-data'), 'w').close()\n"
+                        "    sys.exit(42)\n"
+                        "if source == %r:\n"
+                        "    sys.exit(43)\n"
+                        "atomic_replace.atomic_replace(source, destination)\n"
+                        % (os.path.join(REPO, "tools"),
+                           self.app("Speicher freigeben.app"), changed_target,
+                           self.app(), self.app(), self.app(), self.app()))
+                result = self.run_installer()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Rollback", result.stderr)
+                stages = [os.path.join(self.apps, name) for name in os.listdir(self.apps)
+                          if name.startswith(".ncpin-stage")]
+                self.assertEqual(len(stages), 1)
+                self.assertIn(stages[0], result.stderr)
+                self.assertEqual(os.lstat(stages[0]).st_ino, old_inode)
+                with open(os.path.join(stages[0], "old-data")) as handle:
+                    self.assertEqual(handle.read(), "Original")
+                if changed_target:
+                    self.assertTrue(os.path.exists(os.path.join(self.app(), "foreign-data")))
+                    shutil.rmtree(self.app())
+                shutil.rmtree(stages[0])
+
+    def test_generated_apps_are_registered_with_launchservices(self):
+        self.install_ok()
+        registrar = ("/System/Library/Frameworks/CoreServices.framework/"
+                     "Frameworks/LaunchServices.framework/Support/lsregister")
+        apps = self.install_targets()[:2]
+        # Registrieren startet kein Bundle und verlangt keine Finder-Events.
+        # Auch bei Fehlern nur die selbst erzeugten Testpfade deregistrieren.
+        try:
+            registered = subprocess.run([registrar, "-f"] + apps,
+                                        capture_output=True, text=True)
+            self.assertEqual(registered.returncode, 0, registered.stderr)
+            dump = subprocess.run([registrar, "-dump"],
+                                  capture_output=True, text=True)
+            self.assertEqual(dump.returncode, 0, dump.stderr)
+            for app in apps:
+                self.assertIn(os.path.realpath(app), dump.stdout)
+        finally:
+            unregistered = subprocess.run([registrar, "-u"] + apps,
+                                          capture_output=True, text=True)
+            self.assertEqual(unregistered.returncode, 0, unregistered.stderr)
+
     def test_target_replaced_during_copy_is_rolled_back_not_deleted(self):
         # Rennen im "Ziel existiert"-Zweig: Beim Preflight lag dort der eigene
         # Stand, waehrend des Kopierens wird er durch ein fremdes Artefakt

@@ -12,7 +12,7 @@ Prompts: `prompt_local.txt` / `prompt_online.txt` (liegen im lokalen
 Bildgenerierungs-Arbeitsordner, nicht im Repo). Negative-Prompts halten online
 frei von Pin/Zipfel, local frei von Füllung.
 
-> **TODO (offen):** sehr ähnliche Icons nochmal generieren, aber mit
+> **Optionale Variante (nur auf Wunsch):** sehr ähnliche Icons nochmal generieren, aber mit
 > **fotorealistischer Pin-Nadel** wie in den früheren Icons (Familie A1 unten).
 > Frühere PNGs: nur noch in git-History (aus dem Tree entfernt, 2026-06-07);
 > Prompts vollständig hier dokumentiert.

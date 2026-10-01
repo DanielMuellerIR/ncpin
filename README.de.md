@@ -60,8 +60,13 @@ Der Installer ist idempotent und pro-Mac:
 
 Apps und Workflows werden zunächst vollständig in einem temporären Verzeichnis gebaut und geprüft
 und erst danach atomar eingesetzt. Gleichnamige fremde Apps, Workflows oder CLI-Ziele werden nicht
-überschrieben. Eine bewusste Übernahme ist mit `./install.sh --force` möglich. Der Aufruf
-`./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
+überschrieben. Eine bewusste Übernahme ist mit `./install.sh --force` möglich.
+Seit ncpin 1.3.6 bleiben alle fünf Altstände bis zum Abschluss der Installation und App-Registrierung
+erhalten. Bei einem späteren Fehler werden sie in umgekehrter Reihenfolge wiederhergestellt;
+bei einer fehlgeschlagenen Erstinstallation werden die neuen Artefakte entfernt. Ersetzt ein anderer
+Prozess während des Rollbacks ein Ziel, erhält der Installer die Sicherung und meldet ihren Pfad,
+statt das veränderte Ziel zu überschreiben.
+Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
 ### Signierung, Notarisierung & Berechtigungen

@@ -60,6 +60,10 @@ The installer is idempotent and per Mac:
 Apps and workflows are fully built and verified in a temporary directory before they are installed
 with an atomic replacement. Existing unrelated apps, workflows, or CLI targets with the same name
 are never overwritten by default. Use `./install.sh --force` for an intentional takeover.
+Since ncpin 1.3.6, all five previous artifacts are retained until installation and app registration
+finish. A later failure restores them in reverse order; a failed first installation removes the
+new artifacts. If another process replaces a target during rollback, the installer preserves the
+backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
