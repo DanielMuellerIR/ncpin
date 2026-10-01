@@ -5,10 +5,12 @@
    (ncpin 1.2.0, Antwort auf die in v34 entfernte Socket-API) hängt an beidem.
    Die Alternativen von damals (Client-Downgrade auf 4.0.11, Upstream-Issue,
    File-Provider-Backend) sind nur dann wieder relevant.
-1. Echten Droplet- und Toolbarstart über LaunchServices an einem aktuellen,
-   notarisierten Build prüfen. Die automatisierte Registrierung ist abgedeckt;
-   sie beweist noch keinen App-Start oder Finder-/TCC-Zugriff. Diese Abnahme
-   braucht eine freigegebene GUI-Testsitzung und Signierung/Notarisierung.
+1. Ordner-Picker bei leerer Finder-Auswahl und Finder-Fehlerwege an einem
+   aktuellen notarisierten Build abschließend prüfen. Droplet und Auswahl-
+   Klickstart sind abgenommen. Die Picker-Prüfung wurde durch einen AppleEvent-
+   Timeout bei der GUI-Erfassung unterbrochen; ein Rohdialog mit -1712 wurde
+   beobachtet. Vor einer Codeänderung Ursache und Reproduzierbarkeit klären,
+   ohne TCC zurückzusetzen oder den Finder mit offenen Nutzerfenstern zu beenden.
 2. Optional: Foto-Pin-Iconvariante als kuratiertes Asset-Experiment; vorhandene
    flache Icons bleiben bis zu einer bewussten Auswahl gültig.
 
@@ -25,6 +27,11 @@ Erledigt mit ncpin 1.3.6:
   Clients und explizite Test-Sockets.
 - LaunchServices-Registrierung beider erzeugten Apps mit Nachweis im Registry-Dump
   und anschließender Deregistrierung der temporären Testpfade, ohne App-Start.
+- Beide Dropletaktionen und Auswahl-Klickstart beider Apps über LaunchServices
+  an einem aktuellen Developer-ID-signierten, notarisierten und gestapelten
+  Build. Isolierter Socket und Testdatei mit Leerzeichen/Apostroph; jeder MAKE-
+  Befehl wurde anschließend bis zum Zielzustand gepollt. Gatekeeper akzeptiert
+  beide Bundles; strikte Signaturprüfung auch nach den App-Läufen erfolgreich.
 
 Nicht offen: der sichere Roundtrip mit explizitem Fixture, die frühere
 Drei-Sekunden-Grundlatenz, fehlende TCC-Identität und Asset-Katalog-Überdeckung.
