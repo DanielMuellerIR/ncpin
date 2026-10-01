@@ -246,7 +246,7 @@ class InstallerTest(unittest.TestCase):
                 self.assertIn(erwartet, text)
                 self.assertNotIn(im_repo, text)
                 # Und die verstaendliche Meldung, falls die App fehlt.
-                self.assertIn("Die zugehoerige App fehlt", text)
+                self.assertIn("Die zugehörige App fehlt", text)
 
                 # Der Pfad muss auch wirklich auf eine ausfuehrbare Datei
                 # zeigen — sonst waere der Test gruen und die Aktion trotzdem

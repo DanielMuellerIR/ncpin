@@ -51,9 +51,15 @@ on runNcpin(posixPaths)
 	set cmd to "/usr/bin/python3 " & quoted form of ncpin & " " & ncAction & argline & " --wait"
 	try
 		set out to do shell script cmd
-		display notification ((count of posixPaths) as text) & " Objekt(e): " & ncLabel with title "Nextcloud"
+		set objectCount to count of posixPaths
+		if objectCount is 1 then
+			set objectLabel to "Objekt"
+		else
+			set objectLabel to "Objekte"
+		end if
+		display notification (ncLabel & ": " & objectCount & " " & objectLabel & " verarbeitet.") with title "Nextcloud"
 	on error errMsg number errNum
-		display dialog "ncpin Fehler (" & errNum & "):" & return & errMsg buttons {"OK"} default button "OK" with icon stop
+		display dialog "ncpin-Fehler (" & errNum & "):" & return & errMsg buttons {"OK"} default button "OK" with icon stop
 	end try
 end runNcpin
 
@@ -95,7 +101,7 @@ on showFinderProblem(problemKind)
 	else if problemKind is "timeout" then
 		display dialog "Der Finder antwortet nicht innerhalb von 5 Sekunden." & return & return & "Versuche es nach einem Finder-Neustart erneut. Bis dahin kannst du die ncpin-CLI nutzen oder Objekte direkt auf die App ziehen." buttons {"OK"} default button "OK" with icon caution
 	else if problemKind is "no-window" then
-		display dialog "Kein Finder-Fenster offen." & return & return & "Oeffne einen Nextcloud-Ordner. Alternativ nutze die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
+		display dialog "Kein Finder-Fenster offen." & return & return & "Öffne einen Nextcloud-Ordner. Alternativ nutze die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
 	else
 		display dialog "Der Finder konnte nicht gelesen werden." & return & return & "Nutze vorerst die ncpin-CLI oder ziehe Objekte direkt auf die App." buttons {"OK"} default button "OK" with icon caution
 	end if
@@ -174,7 +180,7 @@ on pickFromFrontWindow()
 		return {}
 	end if
 	set dispNames to paragraphs of rawList
-	set chosen to (choose from list dispNames with prompt (ncLabel & " — Objekte im Ordner waehlen:") with multiple selections allowed without empty selection allowed)
+	set chosen to (choose from list dispNames with prompt (ncLabel & " — Objekte im Ordner auswählen:") with multiple selections allowed without empty selection allowed)
 	if chosen is false then
 		-- Abbrechen oder Esc
 		return {}

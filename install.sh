@@ -452,7 +452,7 @@ notarize_app() {
 	echo "   notarisiert, gestapelt und von Gatekeeper akzeptiert: $name"
 }
 
-build_app local "lokal halten" "$BUILT_APP1" "$BUNDLE_BASE.local"
+build_app local "Lokal halten" "$BUILT_APP1" "$BUNDLE_BASE.local"
 build_app online "Speicher freigeben" "$BUILT_APP2" "$BUNDLE_BASE.online"
 
 # Die Quick Actions rufen die CLI-Kopie in der INSTALLIERTEN App auf, nicht die

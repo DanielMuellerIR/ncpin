@@ -12,11 +12,11 @@ import sys
 
 def render(template, action, label):
     if action not in ("local", "online"):
-        raise ValueError("ungueltige Aktion: %s" % action)
+        raise ValueError("Ungültige Aktion: %s" % action)
     if "\n" in label or "\r" in label:
-        raise ValueError("Zeilenumbrueche sind im Label nicht erlaubt")
+        raise ValueError("Zeilenumbrüche sind im Label nicht erlaubt")
     if '"' in label or "\\" in label:
-        raise ValueError('Anfuehrungszeichen und Backslash sind im Label nicht erlaubt')
+        raise ValueError('Anführungszeichen und Backslash sind im Label nicht erlaubt')
     return (template
             .replace("@@ACTION@@", action)
             .replace("@@LABEL@@", label))

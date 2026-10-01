@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.7 korrigiert die deutschen App- und Quick-Action-Texte, einschließlich der Umlaute im Ordner-Picker.
+
 ### Signierung, Notarisierung & Berechtigungen
 
 Liegt ein **Developer-ID**-Zertifikat im Schlüsselbund, signiert `install.sh` die zwei Apps

@@ -67,6 +67,8 @@ backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
+Version 1.3.7 corrects German app and Quick Action messages, including umlauts in the folder picker.
+
 ### Signing, notarization & permissions
 
 If a **Developer ID** certificate is present in your keychain, `install.sh` automatically signs the

@@ -36,9 +36,9 @@ def build(action, title, ncpin, out_bundle):
     # Shell-Skript der Aktion: ncpin auf alle übergebenen Pfade ("$@"),
     # danach kurze Notification als Rückmeldung.
     if action == "local":
-        note = "werden lokal geholt"
+        note = "Download angefordert."
     else:
-        note = "Speicher freigegeben"
+        note = "Speicherfreigabe angefordert."
     # Der Pfad zeigt in die installierte App (siehe install.sh). Fehlt sie, wuerde
     # zsh nur "command not found" liefern und die Meldung unten "Fehler (Code
     # 127)" anzeigen — daran erkennt niemand die Ursache. Deshalb vorher
@@ -48,7 +48,7 @@ def build(action, title, ncpin, out_bundle):
         '# Eingabe kommt als Argumente (inputMethod=1).\n'
         'ncpin=%s\n'
         'if [ ! -x "$ncpin" ]; then\n'
-        '  /usr/bin/osascript -e \'display notification "Die zugehoerige App fehlt — bitte ncpin neu installieren." with title "ncpin"\'\n'
+        '  /usr/bin/osascript -e \'display notification "Die zugehörige App fehlt — bitte ncpin neu installieren." with title "ncpin"\'\n'
         '  exit 1\n'
         'fi\n'
         '"$ncpin" %s "$@"\n'
