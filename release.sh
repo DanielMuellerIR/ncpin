@@ -172,6 +172,12 @@ ln -s /Applications "$MOUNT_DIR/Applications"
 # ein echtes Finder-Fenster und reißt den Fokus an sich, was headless-Läufe (und
 # Läufe neben laufender Arbeit) stört.
 if [ "$FINDER_LAYOUT" -eq 1 ]; then
+# Finder übernimmt frisch eingehängte Volumes verzögert in sein Objektmodell.
+for attempt in {1..20}; do
+    osascript -e "tell application \"Finder\" to get name of disk \"$VOLNAME\"" \
+        >/dev/null 2>&1 && break
+    sleep 0.5
+done
 osascript <<APPLESCRIPT
 tell application "Finder"
   tell disk "$VOLNAME"
