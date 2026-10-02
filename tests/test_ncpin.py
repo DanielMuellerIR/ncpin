@@ -1088,6 +1088,28 @@ class RenameTransportTests(unittest.TestCase):
             os.close(dirfd)
         self.assertTrue(os.path.exists(other))
 
+    def test_unicode_case_variant_hydrates_the_stored_placeholder(self):
+        self._skip_unless_case_insensitive()
+        placeholder = self.make_placeholder('\u0390.txt')
+        variant = os.path.join(self.root, '\u03aa\u0301.TXT')
+
+        rc, _out, err = self.run_cli('local', variant)
+
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(placeholder))
+        self.assertIn('\u0390.txt', os.listdir(self.root))
+
+    def test_unicode_case_variant_dehydrates_the_stored_file(self):
+        self._skip_unless_case_insensitive()
+        stored = self.make_file('\u0390.txt', b'voller inhalt')
+        variant = os.path.join(self.root, '\u03aa\u0301.TXT')
+
+        rc, _out, err = self.run_cli('online', variant)
+
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(os.path.exists(stored))
+        self.assertIn('\u0390.txt' + self.ncpin.SUFFIX, os.listdir(self.root))
+
     def test_folder_scan_budget_counts_directories_and_hidden_entries(self):
         for name_prefix, is_directory in [('folder-', True), ('.hidden-', False)]:
             with self.subTest(prefix=name_prefix):

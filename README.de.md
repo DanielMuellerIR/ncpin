@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.9 verarbeitet auch Unicode-Schreibungsvarianten, die nach dem Groß-/Kleinschreibungsabgleich erneut normalisiert werden müssen. Wird eine Installation nach einem atomaren Austausch unterbrochen, erkennt der Installer den erfolgten Austausch auch bei beendetem Helfer und stellt den Altstand wieder her, einschließlich mit `--force` ersetzter fremder Ziele.
+
 Version 1.3.8 ordnet anders geschriebene Dateinamen dem richtigen Hardlink zu, begrenzt Ordnerstichproben anhand aller Einträge und rollt unterbrochene Installationsaustausche zurück.
 
 Version 1.3.7 korrigiert die deutschen App- und Quick-Action-Texte, einschließlich der Umlaute im Ordner-Picker.

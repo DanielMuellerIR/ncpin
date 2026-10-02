@@ -330,8 +330,8 @@ artifact_identity() {
 remember_swap() {
 	TX_DEST+=("$1")
 	TX_STAGE+=("$2")
-	TX_NEW_ID+=("$(artifact_identity "$1")")
-	TX_OLD_ID+=("$(artifact_identity "$2")")
+	TX_NEW_ID+=("$3")
+	TX_OLD_ID+=("$4")
 }
 
 finish_install() {
@@ -576,6 +576,46 @@ rollback_foreign_swapout() {  # $1=stage $2=ziel $3=besitzer (leer = CLI-Symlink
 	fi
 }
 
+install_stage() {
+	local stage="$1" destination="$2" owner="${3:-}" new_id old_id stage_id destination_id swap_result=0
+	TX_SWAPPING=1
+	new_id="$(artifact_identity "$stage")"
+	old_id="$(artifact_identity "$destination")"
+	if [ -z "$new_id" ]; then
+		print -u2 -- "FEHLER: Stage-Identitaet fehlt; nicht geloescht: $stage"
+		end_swap
+		return 1
+	fi
+	/usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination" || swap_result=$?
+	stage_id="$(artifact_identity "$stage")"
+	destination_id="$(artifact_identity "$destination")"
+	# Ein Signal kann den Helfer nach dem Rename treffen. Deshalb den realen
+	# Zustand abgleichen, bevor irgendein Stage-Inhalt geloescht wird.
+	if [ "$destination_id" = "$new_id" ] && [ "$stage_id" != "$new_id" ]; then
+		if [ "$swap_result" -eq 0 ] && [ "$FORCE" -eq 0 ] && [ -n "$stage_id" ]; then
+			if { [ -n "$owner" ] && ! is_owned_tree "$stage" "$owner"; } \
+					|| { [ -z "$owner" ] && ! is_owned_link "$stage"; }; then
+				rollback_foreign_swapout "$stage" "$destination" "$owner"
+				end_swap
+				return 1
+			fi
+		fi
+		remember_swap "$destination" "$stage" "$new_id" "$stage_id"
+	else
+		if [ "$stage_id" = "$new_id" ]; then
+			remove_stage "$stage"
+		else
+			print -u2 -- "FEHLER: Austauschzustand unklar; Stage erhalten: $stage"
+		fi
+		if [ "$destination_id" != "$old_id" ]; then
+			print -u2 -- "FEHLER: Ziel waehrend des Austauschs veraendert: $destination"
+		fi
+		swap_result=1
+	fi
+	end_swap
+	return "$swap_result"
+}
+
 install_tree() {
 	local source="$1" destination="$2" owner="$3" parent stage
 	# Der Build kann dauern. Deshalb unmittelbar vor jedem Austausch erneut
@@ -587,22 +627,7 @@ install_tree() {
 		remove_stage "$stage"
 		return 1
 	fi
-	TX_SWAPPING=1
-	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
-		remove_stage "$stage"
-		end_swap
-		return 1
-	fi
-	# Bei einem Swap liegt der alte Stand jetzt am Stage-Pfad. Ohne --force
-	# einen fremden Stand sofort zuruecklegen, eigene Altstaende behalten.
-	if [ "$FORCE" -eq 0 ] && path_exists "$stage" \
-			&& ! is_owned_tree "$stage" "$owner"; then
-		rollback_foreign_swapout "$stage" "$destination" "$owner"
-		end_swap
-		return 1
-	fi
-	remember_swap "$destination" "$stage"
-	end_swap
+	install_stage "$stage" "$destination" "$owner"
 }
 
 install_link() {
@@ -615,19 +640,7 @@ install_link() {
 		return 1
 	fi
 	ln -s "$NCPIN" "$stage"
-	TX_SWAPPING=1
-	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
-		remove_stage "$stage"
-		end_swap
-		return 1
-	fi
-	if [ "$FORCE" -eq 0 ] && path_exists "$stage" && ! is_owned_link "$stage"; then
-		rollback_foreign_swapout "$stage" "$destination"
-		end_swap
-		return 1
-	fi
-	remember_swap "$destination" "$stage"
-	end_swap
+	install_stage "$stage" "$destination"
 }
 
 install_tree "$BUILT_APP1" "$APP1" "$BUNDLE_BASE.local"

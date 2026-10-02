@@ -69,6 +69,7 @@ class InstallerTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
 
     def app(self, name="Lokal halten.app"):
@@ -722,6 +723,73 @@ class InstallerTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 143, result.stderr)
                 self.assertEqual(os.lstat(target).st_ino, old_inode)
                 self.assert_no_stages()
+
+    def test_process_group_signal_preserves_original_tree_and_link(self):
+        # Der Helfer stirbt ebenfalls: Sein Exit-Status beweist nicht, dass
+        # RENAME_SWAP unterblieben ist. Auch fremde --force-Altstaende erhalten.
+        for force in (False, True):
+            for target in (self.app(), os.path.join(self.links, 'ncpin')):
+                with self.subTest(force=force, target=target):
+                    helper = os.path.join(self.copy, 'tools', 'atomic_replace.py')
+                    shutil.copy2(os.path.join(REPO, 'tools', 'atomic_replace.py'), helper)
+                    self.install_ok()
+                    if force:
+                        if os.path.islink(target):
+                            os.unlink(target)
+                            os.symlink('/bin/sh', target)
+                        else:
+                            shutil.rmtree(target)
+                            os.mkdir(target)
+                            with open(os.path.join(target, 'foreign-data'), 'w') as handle:
+                                handle.write('Original')
+                    old_inode = os.lstat(target).st_ino
+                    with open(helper, 'w', encoding='utf-8') as handle:
+                        handle.write(
+                            "import os, signal, sys\n"
+                            "sys.path.insert(0, %r)\n"
+                            "import atomic_replace\n"
+                            "source, destination = sys.argv[1:]\n"
+                            "atomic_replace.atomic_replace(source, destination)\n"
+                            "if destination == %r:\n"
+                            "    os.killpg(os.getpgrp(), signal.SIGTERM)\n"
+                            % (os.path.join(REPO, 'tools'), target))
+                    result = self.run_installer(*(['--force'] if force else []))
+                    self.assertEqual(result.returncode, 143, result.stderr)
+                    self.assertEqual(os.lstat(target).st_ino, old_inode)
+                    if force:
+                        if os.path.islink(target):
+                            self.assertEqual(os.readlink(target), '/bin/sh')
+                        else:
+                            with open(os.path.join(target, 'foreign-data')) as handle:
+                                self.assertEqual(handle.read(), 'Original')
+                        if os.path.islink(target):
+                            os.unlink(target)
+                        else:
+                            shutil.rmtree(target)
+                    self.assert_no_stages()
+
+    def test_process_group_signal_first_install_before_and_after_rename(self):
+        for after_rename in (False, True):
+            for target in (self.app(), os.path.join(self.links, 'ncpin')):
+                with self.subTest(after_rename=after_rename, target=target):
+                    helper = os.path.join(self.copy, 'tools', 'atomic_replace.py')
+                    with open(helper, 'w', encoding='utf-8') as handle:
+                        handle.write(
+                            "import os, signal, sys\n"
+                            "sys.path.insert(0, %r)\n"
+                            "import atomic_replace\n"
+                            "source, destination = sys.argv[1:]\n"
+                            "if destination == %r and not %r:\n"
+                            "    os.killpg(os.getpgrp(), signal.SIGTERM)\n"
+                            "atomic_replace.atomic_replace(source, destination)\n"
+                            "if destination == %r:\n"
+                            "    os.killpg(os.getpgrp(), signal.SIGTERM)\n"
+                            % (os.path.join(REPO, 'tools'), target, after_rename, target))
+                    result = self.run_installer()
+                    self.assertEqual(result.returncode, 143, result.stderr)
+                    for installed_target in self.install_targets():
+                        self.assertFalse(os.path.lexists(installed_target), installed_target)
+                    self.assert_no_stages()
 
     def test_blocked_rollback_preserves_backup_and_reports_its_path(self):
         for changed_target in (False, True):
