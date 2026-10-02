@@ -1076,6 +1076,45 @@ class RenameTransportTests(unittest.TestCase):
         self.assertFalse(os.path.exists(stored))
         self.assertIn("CaseName.txt" + self.ncpin.SUFFIX, os.listdir(self.root))
 
+    def test_case_variant_selects_requested_hardlink(self):
+        self._skip_unless_case_insensitive()
+        other = self.make_file("z-target.txt", b"voller inhalt")
+        requested = os.path.join(self.root, "a-other.txt")
+        os.link(other, requested)
+        dirfd = os.open(self.root, os.O_RDONLY)
+        try:
+            self.assertEqual(self.ncpin._stored_name_at(dirfd, "A-OTHER.TXT"), "a-other.txt")
+        finally:
+            os.close(dirfd)
+        self.assertTrue(os.path.exists(other))
+
+    def test_folder_scan_budget_counts_directories_and_hidden_entries(self):
+        for name_prefix, is_directory in [('folder-', True), ('.hidden-', False)]:
+            with self.subTest(prefix=name_prefix):
+                folder = os.path.join(self.root, name_prefix + 'sample')
+                os.makedirs(folder)
+                for i in range(self.ncpin.FOLDER_SCAN_CAP + 100):
+                    path = os.path.join(folder, name_prefix + str(i))
+                    if is_directory:
+                        os.mkdir(path)
+                    else:
+                        with open(path, 'wb') as handle:
+                            handle.write(b'xx')
+                consumed = [0]
+                real_scandir = os.scandir
+                class CountingScandir:
+                    def __init__(self, inner): self.inner = inner
+                    def __iter__(self): return self
+                    def __next__(self):
+                        value = next(self.inner)
+                        consumed[0] += 1
+                        return value
+                    def __enter__(self): return self
+                    def __exit__(self, *args): self.inner.close()
+                with mock.patch('os.scandir', side_effect=lambda *a, **k: CountingScandir(real_scandir(*a, **k))):
+                    self.ncpin.fs_folder_state(folder)
+                self.assertLessEqual(consumed[0], self.ncpin.FOLDER_SCAN_CAP)
+
     def test_dehydrating_a_folder_preflights_every_file_before_the_first_rename(self):
         # Die READMEs versprechen: Bei einer Journalabweichung bricht ncpin ab,
         # BEVOR es im Ordner die erste Datei umbenennt — auch bei Dehydrierung.

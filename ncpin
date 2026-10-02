@@ -560,7 +560,7 @@ def fs_file_state(ondisk):
     return _state_from_size(os.path.basename(ondisk), size)
 
 
-def _iter_visible_files(folder, scan_errors):
+def _iter_visible_files(folder, scan_errors, max_entries=None):
     """Liefert (Verzeichnispfad, DirEntry) für jede sichtbare Datei, lazy.
 
     Ersatz für os.walk: os.walk liest jedes Verzeichnis KOMPLETT ein, bevor es
@@ -574,6 +574,7 @@ def _iter_visible_files(folder, scan_errors):
     wird), statt still übergangen zu werden.
     """
     pending = [folder]
+    consumed = 0
     while pending:
         current = pending.pop()
         try:
@@ -584,7 +585,12 @@ def _iter_visible_files(folder, scan_errors):
             continue
         with iterator:
             try:
-                for entry in iterator:
+                while max_entries is None or consumed < max_entries:
+                    try:
+                        entry = next(iterator)
+                    except StopIteration:
+                        break
+                    consumed += 1
                     if entry.name.startswith("."):
                         continue
                     if entry.is_dir(follow_symlinks=False):
@@ -594,6 +600,8 @@ def _iter_visible_files(folder, scan_errors):
             except OSError as exc:
                 if scan_errors is not None:
                     scan_errors.append(exc)
+        if max_entries is not None and consumed >= max_entries:
+            return
 
 
 def fs_folder_state(folder, exact=False):
@@ -620,15 +628,11 @@ def fs_folder_state(folder, exact=False):
     damit Aktion und Warten dieselbe Aussage treffen.
     """
     seen_local = seen_online = False
-    scanned = 0
     # Die Fehler werden nur eingesammelt; entschieden wird am Ende (siehe unten).
     # Im Stichprobenmodus interessieren sie nicht (None = nicht sammeln).
     scan_errors = [] if exact else None
-    for _dirpath, entry in _iter_visible_files(folder, scan_errors):
-        if not exact:
-            scanned += 1
-            if scanned > FOLDER_SCAN_CAP:
-                break
+    for _dirpath, entry in _iter_visible_files(
+            folder, scan_errors, None if exact else FOLDER_SCAN_CAP):
         try:
             st = entry.stat(follow_symlinks=False)
         except OSError:
@@ -1115,23 +1119,26 @@ def _stored_name_at(dirfd, name):
     APFS ist meist case-insensitive: ``CASENAME.TXT`` findet ``CaseName.txt``.
     Suffix-Ableitung, Journalpfad und Rename müssen aber mit der gespeicherten
     Schreibweise arbeiten, sonst sucht der Journalabgleich einen Schlüssel, den
-    es nicht gibt. Der Abgleich läuft über die Inode (samestat), fd-relativ,
-    also unabhängig vom Pfadstring. Ein exakt gleicher Name gewinnt, damit
-    Hardlinks im selben Ordner nicht den Namen tauschen.
+    es nicht gibt. Der Abgleich prüft Inode und normalisierte Schreibweise fd-relativ.
+    Die Inode allein wäre bei mehreren Hardlinks im selben Ordner mehrdeutig.
     """
     st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    normalized = unicodedata.normalize("NFC", name).casefold()
+    candidates = []
     with os.scandir(dirfd) as entries:
-        fallback = None
         for entry in entries:
             if entry.name == name:
                 return name
-            if fallback is None:
-                try:
-                    if os.path.samestat(entry.stat(follow_symlinks=False), st):
-                        fallback = entry.name
-                except OSError:
-                    continue
-    return name if fallback is None else fallback
+            if unicodedata.normalize("NFC", entry.name).casefold() != normalized:
+                continue
+            try:
+                if os.path.samestat(entry.stat(follow_symlinks=False), st):
+                    candidates.append(entry.name)
+            except OSError:
+                continue
+    if len(candidates) != 1:
+        raise OSError(errno.EINVAL, "Gespeicherter Dateiname ist nicht eindeutig", name)
+    return candidates[0]
 
 
 def _rename_pin_file(ondisk, target, rename_ctx, roots):
@@ -1511,7 +1518,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.7")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.8")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)

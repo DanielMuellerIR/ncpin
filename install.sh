@@ -320,6 +320,8 @@ fi
 BUILD="$(mktemp -d "${TMPDIR:-/tmp}/ncpin-install.XXXXXX")"
 typeset -a TX_DEST TX_STAGE TX_NEW_ID TX_OLD_ID
 TX_COMMITTED=0
+TX_SWAPPING=0
+TX_ABORT=0
 
 artifact_identity() {
 	/usr/bin/stat -f '%d:%i' "$1" 2>/dev/null || true
@@ -378,8 +380,21 @@ finish_install() {
 # zsh fuehrt EXIT bei errexit aus einer Funktion nicht automatisch aus.
 # ZERR sorgt auch dort fuer die gemeinsame Rueckabwicklung.
 trap finish_install EXIT ZERR
-trap 'exit 130' INT
-trap 'exit 143' TERM HUP
+# Signale im kurzen Swap-Fenster erst nach Eintrag in das Rollback-Journal
+# ausführen. Sonst ist der bereits eingesetzte neue Stand dem Trap unbekannt.
+request_abort() {
+    if [ "$TX_SWAPPING" -eq 1 ]; then
+        TX_ABORT="$1"
+    else
+        exit "$1"
+    fi
+}
+end_swap() {
+    TX_SWAPPING=0
+    if [ "$TX_ABORT" -ne 0 ]; then exit "$TX_ABORT"; fi
+}
+trap 'request_abort 130' INT
+trap 'request_abort 143' TERM HUP
 BUILD_APPS="$BUILD/apps"
 BUILD_SERVICES="$BUILD/services"
 mkdir -p "$BUILD_APPS" "$BUILD_SERVICES"
@@ -572,8 +587,10 @@ install_tree() {
 		remove_stage "$stage"
 		return 1
 	fi
+	TX_SWAPPING=1
 	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
 		remove_stage "$stage"
+		end_swap
 		return 1
 	fi
 	# Bei einem Swap liegt der alte Stand jetzt am Stage-Pfad. Ohne --force
@@ -581,9 +598,11 @@ install_tree() {
 	if [ "$FORCE" -eq 0 ] && path_exists "$stage" \
 			&& ! is_owned_tree "$stage" "$owner"; then
 		rollback_foreign_swapout "$stage" "$destination" "$owner"
+		end_swap
 		return 1
 	fi
 	remember_swap "$destination" "$stage"
+	end_swap
 }
 
 install_link() {
@@ -596,15 +615,19 @@ install_link() {
 		return 1
 	fi
 	ln -s "$NCPIN" "$stage"
+	TX_SWAPPING=1
 	if ! /usr/bin/python3 "$REPO/tools/atomic_replace.py" "$stage" "$destination"; then
 		remove_stage "$stage"
+		end_swap
 		return 1
 	fi
 	if [ "$FORCE" -eq 0 ] && path_exists "$stage" && ! is_owned_link "$stage"; then
 		rollback_foreign_swapout "$stage" "$destination"
+		end_swap
 		return 1
 	fi
 	remember_swap "$destination" "$stage"
+	end_swap
 }
 
 install_tree "$BUILT_APP1" "$APP1" "$BUNDLE_BASE.local"

@@ -701,6 +701,28 @@ class InstallerTest(unittest.TestCase):
                 self.assertEqual(handle.read(), "Original")
         self.assert_no_stages()
 
+    def test_signal_immediately_after_swap_rolls_back_tree_and_link(self):
+        for target in (self.app(), os.path.join(self.links, 'ncpin')):
+            with self.subTest(target=target):
+                helper = os.path.join(self.copy, 'tools', 'atomic_replace.py')
+                shutil.copy2(os.path.join(REPO, 'tools', 'atomic_replace.py'), helper)
+                self.install_ok()
+                old_inode = os.lstat(target).st_ino
+                with open(helper, 'w', encoding='utf-8') as handle:
+                    handle.write(
+                        "import os, signal, sys\n"
+                        "sys.path.insert(0, %r)\n"
+                        "import atomic_replace\n"
+                        "source, destination = sys.argv[1:]\n"
+                        "atomic_replace.atomic_replace(source, destination)\n"
+                        "if destination == %r:\n"
+                        "    os.kill(os.getppid(), signal.SIGTERM)\n"
+                        % (os.path.join(REPO, 'tools'), target))
+                result = self.run_installer()
+                self.assertEqual(result.returncode, 143, result.stderr)
+                self.assertEqual(os.lstat(target).st_ino, old_inode)
+                self.assert_no_stages()
+
     def test_blocked_rollback_preserves_backup_and_reports_its_path(self):
         for changed_target in (False, True):
             with self.subTest(changed_target=changed_target):

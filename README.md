@@ -67,6 +67,8 @@ backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
+Version 1.3.8 keeps case-variant requests tied to the requested hardlink, bounds folder sampling by all directory entries, and rolls back interrupted installation swaps.
+
 Version 1.3.7 corrects German app and Quick Action messages, including umlauts in the folder picker.
 
 ### Signing, notarization & permissions
