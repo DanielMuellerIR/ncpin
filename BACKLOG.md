@@ -33,6 +33,11 @@ Erledigt mit ncpin 1.3.10:
 - 147 automatisierte Tests mit minimaler Umgebung und macOS-System-Python,
   Python-/Shell-Syntax und reales, nicht mutierendes Latenzgate bestanden.
   Apps und DMG signiert, notarisiert, gestapelt und von Gatekeeper akzeptiert.
+- Beide Datei-Droplets sowie Abbrechen/Bestätigen der rekursiven Ordnerfreigabe
+  in App und echtem Automator-Workflow mit isoliertem Socket geprüft. Abbrechen
+  sendet keine Aktion; bestätigte Aktionen und Zielzustände sind belegt.
+  Dialoge visuell geprüft, Abbrechen ist die sichere Standardauswahl.
+  Strikte App-Signaturprüfung nach dem Lauf erfolgreich.
 
 Erledigt mit ncpin 1.3.6:
 
