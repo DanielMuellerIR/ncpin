@@ -5,6 +5,15 @@
    (ncpin 1.2.0, Antwort auf die in v34 entfernte Socket-API) hängt an beidem.
    Die Alternativen von damals (Client-Downgrade auf 4.0.11, Upstream-Issue,
    File-Provider-Backend) sind nur dann wieder relevant.
+   Verifiziert am 2026-10-07 gegen den stabilen Client 34.0.5
+   ([Quellstand](https://github.com/nextcloud/desktop/tree/62ebad6043b1e7c8e319f41be25d41f5a2c733e5))
+   und den aktuellen Entwicklungsstand
+   ([Quellstand](https://github.com/nextcloud/desktop/tree/edf26f2b1b98e1bd5c25b25f47808479236040cd)):
+   Suffix-Backend, 1-Byte-Platzhalter und beide Rename-Aktionen bestehen weiter.
+   Hydrierung verlangt weiterhin virtuellen Journaltyp, gleiche Inode und mtime;
+   Dehydrierung verlangt gleiche Größe und mtime. Die ncpin-Vorprüfungen passen
+   dazu. Erneut prüfen bei einem Client-Upgrade mit Änderungen an diesen
+   Mechanismen oder bei einem reproduzierbaren Kompatibilitätsfehler.
 1. Optional: Foto-Pin-Iconvariante als kuratiertes Asset-Experiment; vorhandene
    flache Icons bleiben bis zu einer bewussten Auswahl gültig.
 
