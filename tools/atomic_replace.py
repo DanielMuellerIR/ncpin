@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Ersetzt ein Installationsartefakt auf macOS atomar.
+"""Ersetzt Installationsartefakte atomar und entfernt nur erneut geprüfte eigene Ziele.
 
 Quelle und Ziel muessen im selben Verzeichnis/Dateisystem liegen. Existiert das
 Ziel, tauscht renamex_np(RENAME_SWAP) beide Namen in einem Schritt; danach liegt
@@ -12,7 +12,11 @@ mit EEXIST ab, statt es still zu ersetzen — der Installer sieht die Kollision.
 
 import ctypes
 import os
+import plistlib
+import shutil
+import signal
 import sys
+import tempfile
 
 
 RENAME_SWAP = 0x00000002
@@ -46,7 +50,57 @@ def atomic_replace(source, destination):
     _renamex(source, destination, RENAME_SWAP)
 
 
+def _owned_artifact(target, kind, owner):
+    if kind == "link":
+        return os.path.islink(target) and os.readlink(target) == owner
+    if os.path.islink(target) or not os.path.isdir(target):
+        return False
+    try:
+        with open(os.path.join(target, "Contents", "Info.plist"), "rb") as handle:
+            return plistlib.load(handle).get("NCPINOwnerIdentifier") == owner
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def remove_owned(target, kind, owner):
+    """Bindet ein Uninstall-Ziel vor der letzten Besitzprüfung an einen privaten Ort.
+
+    Ein zwischen Prüfung und Verschieben ersetztes Ziel wird exklusiv
+    zurückgelegt. Ist sein alter Name inzwischen belegt, bleibt es erhalten
+    und der Fehler nennt den Wiederherstellungspfad.
+    """
+    if not os.path.lexists(target):
+        return False
+    original = os.lstat(target)
+    if not _owned_artifact(target, kind, owner):
+        return False
+    holding = tempfile.mkdtemp(prefix=".ncpin-uninstall-", dir=os.path.dirname(target))
+    held = os.path.join(holding, "artifact")
+    try:
+        _renamex(target, held, RENAME_EXCL)
+        current = os.lstat(held)
+        if (not os.path.samestat(original, current)
+                or not _owned_artifact(held, kind, owner)):
+            return False
+        if kind == "link":
+            os.unlink(held)
+        else:
+            shutil.rmtree(held)
+        return True
+    finally:
+        if os.path.lexists(held):
+            try:
+                _renamex(held, target, RENAME_EXCL)
+            except OSError as exc:
+                raise RuntimeError("Uninstall-Ziel erhalten unter %s; Rücklegen nach %s fehlgeschlagen: %s"
+                                   % (held, target, exc))
+        os.rmdir(holding)
+
+
 def main(argv):
+    if len(argv) == 3 and argv[0] in ("--remove-tree", "--remove-link"):
+        kind = "tree" if argv[0] == "--remove-tree" else "link"
+        return 0 if remove_owned(argv[1], kind, argv[2]) else 3
     if len(argv) != 2:
         sys.stderr.write("Aufruf: atomic_replace.py <quelle> <ziel>\n")
         return 2
@@ -55,4 +109,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(signum, interrupted)
     sys.exit(main(sys.argv[1:]))

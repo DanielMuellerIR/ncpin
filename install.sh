@@ -96,24 +96,28 @@ is_owned_link() {
 }
 
 remove_owned_tree() {
-	local target="$1" owner="$2"
+	local target="$1" owner="$2" result=0
 	if ! path_exists "$target"; then return; fi
-	if is_owned_tree "$target" "$owner"; then
-		rm -rf -- "$target"
+	/usr/bin/python3 "$REPO/tools/atomic_replace.py" --remove-tree "$target" "$owner" || result=$?
+	if [ "$result" -eq 0 ]; then
 		echo "  entfernt: $target"
-	else
+	elif [ "$result" -eq 3 ]; then
 		print -u2 -- "  uebersprungen (nicht als ncpin-eigen markiert): $target"
+	else
+		return "$result"
 	fi
 }
 
 remove_owned_link() {
-	local target="$1"
+	local target="$1" result=0
 	if ! path_exists "$target"; then return; fi
-	if is_owned_link "$target"; then
-		unlink "$target"
+	/usr/bin/python3 "$REPO/tools/atomic_replace.py" --remove-link "$target" "$NCPIN" || result=$?
+	if [ "$result" -eq 0 ]; then
 		echo "  Symlink entfernt: $target"
-	else
+	elif [ "$result" -eq 3 ]; then
 		print -u2 -- "  uebersprungen (fremdes CLI-Ziel): $target"
+	else
+		return "$result"
 	fi
 }
 
@@ -259,6 +263,32 @@ target_needs_notary_ticket() {
 	is_protected_dir "$APPS"
 }
 
+reject_stage_install_overlap() {
+	local installed output installed_entry output_entry PROTECTED_APPS
+	for installed in "$APP1" "$APP2" "$QA1" "$QA2" "$LINK"; do
+		installed_entry="${installed:h:A}/${installed:t}"
+		for output in "$STAGE_DIR/Lokal halten.app" "$STAGE_DIR/Speicher freigeben.app" \
+				"$STAGE_DIR/Lokal halten (Nextcloud).workflow" "$STAGE_DIR/Speicher freigeben (Nextcloud).workflow"; do
+			output_entry="${output:h:A}/${output:t}"
+			# Den CLI-Link als Eintrag schützen, nicht nur sein dereferenziertes Ziel.
+			if [[ "$output_entry/" == "$installed_entry/"* || "$installed_entry/" == "$output_entry/"* ]]; then
+				print -u2 -- "FEHLER: --stage-only überschneidet sich mit Installationsziel $installed."
+				exit 2
+			fi
+			PROTECTED_APPS="${installed:A}"
+			if is_protected_dir "$output"; then
+				print -u2 -- "FEHLER: --stage-only überschneidet sich mit Installationsziel $installed."
+				exit 2
+			fi
+			PROTECTED_APPS="${output:A}"
+			if is_protected_dir "$installed"; then
+				print -u2 -- "FEHLER: --stage-only überschneidet sich mit Installationsziel $installed."
+				exit 2
+			fi
+		done
+	done
+}
+
 # --stage-only baut nur heraus: Es prueft weder Ticket noch Kollision und
 # entfernt am Zielort gleichnamige Artefakte mit rm -rf. Genau deshalb darf es
 # nie ins geschuetzte Verzeichnis schreiben — sonst waere "./build.sh
@@ -270,6 +300,7 @@ Dort liegen ausschliesslich installierte, notarisierte Bundles.
 Stattdessen:
   ./build.sh                          # baut nach build/ im Projektordner
   ./install.sh                        # installiert notarisiert nach $APPS"
+	reject_stage_install_overlap
 fi
 
 # Das Notary-Gate haengt allein an $APPS. Ohne diese Pruefung fuehren
@@ -507,6 +538,7 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
 	reject_if_protected "$STAGE_DIR" \
 "FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen.
 Dort liegen ausschliesslich installierte, notarisierte Bundles."
+	reject_stage_install_overlap
 	mkdir -p -- "$STAGE_DIR"
 	for artefakt in "$BUILT_APP1" "$BUILT_APP2" "$BUILT_QA1" "$BUILT_QA2"; do
 		rm -rf -- "$STAGE_DIR/${artefakt:t}"

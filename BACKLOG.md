@@ -14,8 +14,25 @@
    Dehydrierung verlangt gleiche Größe und mtime. Die ncpin-Vorprüfungen passen
    dazu. Erneut prüfen bei einem Client-Upgrade mit Änderungen an diesen
    Mechanismen oder bei einem reproduzierbaren Kompatibilitätsfehler.
-1. Optional: Foto-Pin-Iconvariante als kuratiertes Asset-Experiment; vorhandene
-   flache Icons bleiben bis zu einer bewussten Auswahl gültig.
+
+Die vorhandenen flachen Icons bleiben bestehen. Das optionale Foto-Pin-Experiment
+ist derzeit nicht geplant.
+
+Erledigt mit ncpin 1.3.10:
+
+- Syncwurzeln bleiben während einer Operation an ursprünglichen Kernelpfad und
+  Device/Inode gebunden. APFS-Schreibungsvarianten werden über dieselbe Identität
+  erkannt. `list` liest über einen geprüften Verzeichnisdeskriptor, lässt
+  Zeilenumbrüche in Namen aus und meldet unlesbare Ordner als Laufzeitfehler.
+- Stage-only lehnt Überlappungen mit konfigurierten Installationsartefakten ab,
+  einschließlich Alias-Pfaden und eingebetteten CLI-Links. Uninstall isoliert
+  Ziele vor der erneuten Identitäts-/Besitzprüfung und erhält fremde Ersetzungen.
+- Apps und Quick Actions bestätigen rekursive Ordnerfreigaben vor der ersten
+  Aktion. Die CLI zeigt einen Hinweis; Quick Actions erhalten den CLI-Exitcode.
+- Ein fehlgeschlagener Release-Build erhält das letzte geprüfte DMG.
+- 147 automatisierte Tests mit minimaler Umgebung und macOS-System-Python,
+  Python-/Shell-Syntax und reales, nicht mutierendes Latenzgate bestanden.
+  Apps und DMG signiert, notarisiert, gestapelt und von Gatekeeper akzeptiert.
 
 Erledigt mit ncpin 1.3.6:
 

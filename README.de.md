@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.10 bindet jede registrierte Syncwurzel an ihren ursprünglichen Ort und ihre Dateisystemidentität, akzeptiert gültige APFS-Schreibungsvarianten und liest Ordnerlisten über einen geprüften Verzeichnisdeskriptor. Staging darf installierte Artefakte nicht überlappen; Uninstall prüft den Besitz nach dem Isolieren eines Ziels erneut. Quick Actions erhalten den CLI-Exitcode; ein fehlgeschlagener Release-Build erhält das vorherige DMG.
+
 Version 1.3.9 verarbeitet auch Unicode-Schreibungsvarianten, die nach dem Groß-/Kleinschreibungsabgleich erneut normalisiert werden müssen. Wird eine Installation nach einem atomaren Austausch unterbrochen, erkennt der Installer den erfolgten Austausch auch bei beendetem Helfer und stellt den Altstand wieder her, einschließlich mit `--force` ersetzter fremder Ziele.
 
 Version 1.3.8 ordnet anders geschriebene Dateinamen dem richtigen Hardlink zu, begrenzt Ordnerstichproben anhand aller Einträge und rollt unterbrochene Installationsaustausche zurück.
@@ -86,7 +88,8 @@ Ad-hoc-Signierung zurück; ein solcher Build läuft lokal (beim ersten Start ggf
 mit angeheftetem Notary-Ticket. Der Installer bricht mit Exit-Code 2 ab, noch bevor er etwas baut;
 für `NCPIN_NOTARIZE=0` gilt dasselbe. Auch ein reiner Build (`./build.sh <ziel>` beziehungsweise
 `./install.sh --stage-only <ziel>`) verweigert `/Applications` mit Exit-Code 2 — dieser Weg prüft
-weder Notary-Ticket noch Kollision. Stattdessen:
+kein Notary-Ticket. Staging lehnt außerdem Überlappungen mit konfigurierten Installationszielen ab,
+einschließlich Alias-Pfaden. Stattdessen:
 
 ```sh
 ./build.sh                            # Apps bleiben im Projektordner build/
@@ -139,6 +142,8 @@ ncpin status --json ~/Nextcloud/*.pdf   # JSON je Pfad
 `status` verlangt mindestens einen Pfad, `list` genau einen und `doctor` keinen. Falsche Arity oder
 Optionen enden mit Exit 2, bevor irgendein Transport angefasst wird. Optionen dürfen auch zwischen
 mehreren Pfaden stehen (macOS-System-Python eingeschlossen).
+
+Ordneraktionen schließen alle Unterordner ein. Vor dem Freigeben von Ordnerinhalten zeigt die CLI einen Rekursionshinweis (außer mit `--json` oder `--quiet`); Apps und Quick Actions verlangen eine Bestätigung, bevor sie den ersten gewählten Eintrag ändern. `list` lässt Namen mit Zeilenumbrüchen aus, damit daraus keine getrennten Picker-Einträge entstehen. Ein unlesbarer Ordner liefert Exit 1.
 
 Der Datei-Suffix wird automatisch aufgelöst: egal ob du `Film.mp4` oder den Platzhalter
 `Film.mp4.nextcloud` angibst.

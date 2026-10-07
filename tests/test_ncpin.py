@@ -467,6 +467,36 @@ class PathBoundaryTests(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertNotIn("privat.txt", out)
 
+    def test_list_rejects_directory_swap_after_path_check(self):
+        folder = os.path.join(self.root, "ordner")
+        os.mkdir(folder)
+        with open(os.path.join(self.outside, "privat.txt"), "w") as handle:
+            handle.write("privat")
+        original_check = self.ncpin.checked_path
+
+        def check_then_swap(path, roots):
+            checked = original_check(path, roots)
+            os.rename(folder, folder + "-alt")
+            os.symlink(self.outside, folder)
+            return checked
+
+        with mock.patch.object(self.ncpin, "checked_path", side_effect=check_then_swap):
+            with self.assertRaises(self.ncpin.PathOutsideRoots):
+                self.ncpin.list_entries(folder, [self.root])
+
+    def test_list_omits_names_that_split_picker_rows(self):
+        for name in ("safe.txt", "first\nsecond.txt", "first\rthird.txt"):
+            with open(os.path.join(self.root, name), "w") as handle:
+                handle.write("fixture")
+        self.assertEqual(self.ncpin.list_entries(self.root, [self.root]), ["safe.txt"])
+
+    def test_list_reports_io_failure_instead_of_empty_success(self):
+        with mock.patch.object(self.ncpin.os, "listdir", side_effect=OSError(errno.EIO, "fixture")):
+            rc, out, err = self.run_cli("list", "--json", self.root)
+        self.assertEqual(rc, 1)
+        self.assertEqual(out, "")
+        self.assertIn("fixture", err)
+
     def test_inside_symlink_is_canonicalized_before_make_command(self):
         target = os.path.join(self.root, "echt.txt")
         with open(target, "w", encoding="utf-8") as handle:
@@ -1050,6 +1080,49 @@ class RenameTransportTests(unittest.TestCase):
         if not os.path.exists(os.path.join(self.tmp.name, "caseprobe")):
             self.skipTest("Dateisystem ist case-sensitive")
 
+    def test_case_variant_syncroot_accepts_status_and_hydration(self):
+        self._skip_unless_case_insensitive()
+        self.make_placeholder("datei.txt")
+        alias = os.path.join(self.tmp.name, "NEXTCLOUD", "datei.txt")
+        rc, out, err = self.run_cli("status", "--json", alias)
+        self.assertEqual(rc, 0, err + out)
+        rc, out, err = self.run_cli("local", "--json", alias)
+        self.assertEqual(rc, 0, err + out)
+        self.assertTrue(os.path.exists(os.path.join(self.root, "datei.txt")))
+
+    def test_syncroot_symlink_replacement_during_journal_load_is_rejected(self):
+        self.make_placeholder("ordner/datei.txt")
+        moved = os.path.join(self.outside, "moved-root")
+        original_load = self.ncpin._load_journal_entries
+
+        def load_then_replace_root(folder):
+            entries = original_load(folder)
+            os.rename(self.root, moved)
+            os.symlink(moved, self.root)
+            return entries
+
+        with mock.patch.object(self.ncpin, "_load_journal_entries", side_effect=load_then_replace_root):
+            rc, out, err = self.run_cli("local", "--json", os.path.join(self.root, "ordner", "datei.txt"))
+        self.assertEqual(rc, 3, err + out)
+        self.assertTrue(os.path.exists(os.path.join(moved, "ordner", "datei.txt.nextcloud")))
+        self.assertFalse(os.path.exists(os.path.join(moved, "ordner", "datei.txt")))
+
+    def test_recreated_syncroot_does_not_inherit_the_registered_identity(self):
+        roots = self.ncpin.canonical_roots([self.root])
+        os.rename(self.root, os.path.join(self.outside, "original-root"))
+        os.mkdir(self.root)
+        self.assertFalse(self.ncpin.in_any_folder(self.root, roots))
+
+    def test_replaced_root_parent_does_not_move_the_registered_boundary(self):
+        parent = os.path.join(self.tmp.name, "parent")
+        root = os.path.join(parent, "root")
+        os.makedirs(root)
+        roots = self.ncpin.canonical_roots([root])
+        moved = os.path.join(self.outside, "moved-parent")
+        os.rename(parent, moved)
+        os.symlink(moved, parent)
+        self.assertFalse(self.ncpin.in_any_folder(root, roots))
+
     def test_case_variant_file_name_hydrates_the_stored_placeholder(self):
         # Direkte Dateiaktion mit anders geschriebenem DATEInamen: Der Kernel
         # findet CaseName.txt.nextcloud auch ueber CASENAME.TXT, der
@@ -1197,9 +1270,13 @@ class RenameTransportTests(unittest.TestCase):
         # statt einen ungeschuetzten Laufzeitfehler (Exit 1) zu werfen.
         self.make_placeholder("ordner/datei.txt")
         folder = os.path.join(self.root, "ordner")
+        original_fd_path = self.ncpin._fd_path
 
         def fake_fd_path(dirfd):
-            raise OSError(errno.ENOSPC, "No space left on device")
+            current = original_fd_path(dirfd)
+            if current == os.path.realpath(folder):
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return current
 
         with mock.patch.object(self.ncpin, "_fd_path", side_effect=fake_fd_path):
             rc, _out, _err = self.run_cli("local", folder)

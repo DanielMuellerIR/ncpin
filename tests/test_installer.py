@@ -487,6 +487,66 @@ class InstallerTest(unittest.TestCase):
         self.assertIn("--stage-only darf nicht", result.stderr)
         self.assert_old_app_preserved()
 
+    def test_stage_only_refuses_unprotected_installation_targets(self):
+        self.install_ok()
+        open(os.path.join(self.app(), "sentinel"), "w").close()
+        open(os.path.join(self.workflow(), "sentinel"), "w").close()
+        alias = os.path.join(self.root, "apps-alias")
+        os.symlink(self.apps, alias)
+        for destination in (self.apps, self.services, alias,
+                            os.path.join(self.app(), "nested-stage")):
+            with self.subTest(destination=destination):
+                result = self.run_installer("--stage-only", destination)
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self.assert_old_app_preserved()
+                self.assertTrue(os.path.exists(os.path.join(self.workflow(), "sentinel")))
+
+    def test_stage_only_keeps_an_installed_cli_link_inside_an_output(self):
+        stage = os.path.join(self.root, "stage")
+        linkdir = os.path.join(stage, "Lokal halten.app", "bin")
+        env = dict(self.env, NCPIN_LINK_DIR=linkdir)
+        installed = self.run_installer(env=env)
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        result = self.run_installer("--stage-only", stage, env=env)
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertTrue(os.path.islink(os.path.join(linkdir, "ncpin")))
+
+    def test_uninstall_preserves_a_target_replaced_during_ownership_check(self):
+        spec = importlib.util.spec_from_file_location(
+            "remove_owned_test", os.path.join(self.copy, "tools", "atomic_replace.py"))
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        for kind in ("tree", "link"):
+            with self.subTest(kind=kind):
+                target = os.path.join(self.root, "remove-" + kind)
+                if kind == "tree":
+                    os.makedirs(os.path.join(target, "Contents"))
+                    with open(os.path.join(target, "Contents", "Info.plist"), "wb") as handle:
+                        plistlib.dump({"NCPINOwnerIdentifier": "fixture-owner"}, handle)
+                else:
+                    os.symlink("fixture-owner", target)
+                original_owned = helper._owned_artifact
+
+                def replace_after_check(candidate, artifact_kind, owner):
+                    result = original_owned(candidate, artifact_kind, owner)
+                    if candidate == target:
+                        os.rename(target, target + "-original")
+                        if kind == "tree":
+                            os.mkdir(target)
+                            with open(os.path.join(target, "foreign"), "w") as handle:
+                                handle.write("preserve")
+                        else:
+                            os.symlink("foreign", target)
+                    return result
+
+                with mock.patch.object(helper, "_owned_artifact", side_effect=replace_after_check):
+                    self.assertFalse(helper.remove_owned(target, kind, "fixture-owner"))
+                if kind == "tree":
+                    self.assertTrue(os.path.isfile(os.path.join(target, "foreign")))
+                else:
+                    self.assertEqual(os.readlink(target), "foreign")
+                self.assertTrue(os.path.lexists(target + "-original"))
+
     def test_protected_dir_covers_both_macos_names_of_applications(self):
         # /Applications und /System/Volumes/Data/Applications sind auf macOS
         # ueber einen Firmlink DASSELBE Verzeichnis; :A loest das nicht auf.

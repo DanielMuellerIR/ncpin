@@ -39,6 +39,24 @@ def build(action, title, ncpin, out_bundle):
         note = "Download angefordert."
     else:
         note = "Speicherfreigabe angefordert."
+    confirmation = ""
+    if action == "online":
+        dialog = ('try\n'
+                  'display dialog "Speicher in ausgewählten Ordnern freigeben?" & return & return & '
+                  '"Die Aktion wirkt rekursiv auf Dateien und alle Unterordner. Die Dateien bleiben in Nextcloud erhalten '
+                  'und müssen vor der nächsten lokalen Nutzung erneut heruntergeladen werden." '
+                  'buttons {"Abbrechen", "Speicher freigeben"} default button "Abbrechen" '
+                  'cancel button "Abbrechen" with icon caution\n'
+                  'return "confirm"\n'
+                  'on error number -128\nreturn "cancel"\nend try')
+        confirmation = (
+            'for selected in "$@"; do\n'
+            '  if [ -d "$selected" ]; then\n'
+            '    confirmed=$(/usr/bin/osascript -e %s) || exit 1\n'
+            '    [ "$confirmed" = "confirm" ] || exit 0\n'
+            '    break\n'
+            '  fi\n'
+            'done\n') % _q(dialog)
     # Der Pfad zeigt in die installierte App (siehe install.sh). Fehlt sie, wuerde
     # zsh nur "command not found" liefern und die Meldung unten "Fehler (Code
     # 127)" anzeigen — daran erkennt niemand die Ursache. Deshalb vorher
@@ -47,18 +65,20 @@ def build(action, title, ncpin, out_bundle):
         '#!/bin/zsh\n'
         '# Eingabe kommt als Argumente (inputMethod=1).\n'
         'ncpin=%s\n'
-        'if [ ! -x "$ncpin" ]; then\n'
+        'if [ ! -f "$ncpin" ] || [ ! -r "$ncpin" ]; then\n'
         '  /usr/bin/osascript -e \'display notification "Die zugehörige App fehlt — bitte ncpin neu installieren." with title "ncpin"\'\n'
         '  exit 1\n'
         'fi\n'
-        '"$ncpin" %s "$@"\n'
+        '%s'
+        '/usr/bin/python3 -B "$ncpin" %s "$@"\n'
         'rc=$?\n'
         'if [ $rc -eq 0 ]; then\n'
         '  /usr/bin/osascript -e \'display notification "%s" with title "Nextcloud"\'\n'
         'else\n'
         '  /usr/bin/osascript -e \'display notification "Fehler (Code \'"$rc"\')" with title "ncpin"\'\n'
         'fi\n'
-    ) % (_q(ncpin), action, note)
+        'exit "$rc"\n'
+    ) % (_q(ncpin), confirmation, action, note)
 
     in_uuid, out_uuid, act_uuid = uuid(), uuid(), uuid()
 

@@ -82,7 +82,9 @@ RW_DMG="$DIST/ncpin-rw.dmg"
 # nachgelagerte Automatisierung hielte es fuer ein fertiges Release.
 PARTIAL_DMG="$DIST/ncpin-unfertig.dmg"
 mkdir -p -- "$DIST"
-rm -f -- "$DMG" "$RW_DMG" "$PARTIAL_DMG"
+# Das letzte geprüfte Image bleibt erhalten, bis der neue Lauf vollständig
+# erfolgreich ist und es am Ende atomar ersetzt.
+rm -f -- "$RW_DMG" "$PARTIAL_DMG"
 MOUNT_DIR="/Volumes/$VOLNAME"
 # Geraeteknoten (/dev/diskN[sM]) des EIGENEN hdiutil attach. Nur dieses Geraet
 # wird je getrennt — niemals blind der Mountpoint: Dort koennte ein fremdes

@@ -112,6 +112,12 @@ ein nach der Prüfung eingesetzter Symlink in einem Zwischenverzeichnis, um
 `local` außerhalb der Syncwurzel wirken zu lassen (real aufgetreten). Ein
 einmal geprüfter Pfadstring ist nach der Prüfung wertlos.
 
+Registrierte Syncwurzeln behalten für die gesamte Operation ihren ursprünglichen
+Kernelpfad und ihre Dateisystemidentität (Device/Inode). Ein später eingesetzter
+Symlink darf die Wurzel nicht an einen neuen Ort verschieben. Gültige APFS-
+Schreibungsvarianten werden über diese Identität erkannt. Auch `list` liest nur
+über einen erneut geprüften Verzeichnisdeskriptor.
+
 Im `suffix`-VFS-Modus liegt ein online-only Platzhalter als
 `<name>.nextcloud`; ownCloud kann einen anderen Suffix verwenden.
 `resolve_ondisk()` akzeptiert logischen und Platzhalterpfad, gibt aber konsistent

@@ -67,6 +67,8 @@ backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
+Version 1.3.10 keeps each registered sync root tied to its original location and filesystem identity, accepts valid APFS spelling variants, and reads folder lists through a verified directory descriptor. Staging cannot overlap installed artifacts; uninstall rechecks ownership after isolating a target. Quick Actions preserve CLI exit codes, and a failed release build retains the previous DMG.
+
 Version 1.3.9 also handles Unicode case variants that require normalization after case folding. If an installation is interrupted after an atomic swap, the installer detects the completed swap even when the helper is terminated and restores the previous installation, including foreign targets replaced with `--force`.
 
 Version 1.3.8 keeps case-variant requests tied to the requested hardlink, bounds folder sampling by all directory entries, and rolls back interrupted installation swaps.
@@ -83,7 +85,8 @@ build works locally (on first launch you may need to right-click → Open once),
 installed into `/Applications`: that folder holds bundles with a stapled notarization ticket only.
 The installer stops with exit code 2 before it builds anything, and the same applies to
 `NCPIN_NOTARIZE=0`. A plain build (`./build.sh <dir>` or `./install.sh --stage-only <dir>`) also
-refuses `/Applications` with exit code 2 — that path checks neither ticket nor collision.
+refuses `/Applications` with exit code 2 because staging does not validate a notarization ticket.
+Staging also rejects overlap with configured installation targets, including aliases.
 Choose one of these instead:
 
 ```sh
@@ -136,6 +139,8 @@ ncpin status --json ~/Nextcloud/*.pdf    # JSON per path
 requires one or more paths, `list` exactly one, and `doctor` none. Invalid arity or options return
 exit 2 before any transport is touched. Options may appear between multiple paths, including when
 running with the macOS system Python.
+
+Folder actions include all subfolders. Before freeing folder contents, the CLI prints a recursive-action notice (unless `--json` or `--quiet` is used); apps and Quick Actions ask for confirmation before changing the first selected item. `list` omits names containing line breaks so they cannot become separate picker entries. An unreadable folder returns exit 1.
 
 The file suffix is resolved automatically: it doesn't matter whether you pass `Movie.mp4` or the
 placeholder `Movie.mp4.nextcloud`.

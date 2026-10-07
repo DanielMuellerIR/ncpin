@@ -38,6 +38,7 @@ on runNcpin(posixPaths)
 	if posixPaths is {} then
 		return
 	end if
+	if not my confirmRecursiveRelease(posixPaths) then return
 	set ncpin to my ncpinPath()
 	set argline to ""
 	repeat with p in posixPaths
@@ -48,7 +49,7 @@ on runNcpin(posixPaths)
 	-- alte lokale Installationen kompatibel.
 	-- Ausdruecklich mit dem System-Python starten: Die CLI im Bundle muss dafuer
 	-- weder ein Ausfuehrbit noch ein passendes "python3" im PATH haben.
-	set cmd to "/usr/bin/python3 " & quoted form of ncpin & " " & ncAction & argline & " --wait"
+	set cmd to "/usr/bin/python3 -B " & quoted form of ncpin & " " & ncAction & argline & " --wait"
 	try
 		set out to do shell script cmd
 		set objectCount to count of posixPaths
@@ -62,6 +63,22 @@ on runNcpin(posixPaths)
 		display dialog "ncpin-Fehler (" & errNum & "):" & return & errMsg buttons {"OK"} default button "OK" with icon stop
 	end try
 end runNcpin
+
+on confirmRecursiveRelease(posixPaths)
+	if ncAction is not "online" then return true
+	repeat with p in posixPaths
+		set isFolder to do shell script "/bin/test -d " & quoted form of (p as text) & " && /usr/bin/printf yes || /usr/bin/true"
+		if isFolder is "yes" then
+			try
+				display dialog "Speicher in ausgewählten Ordnern freigeben?" & return & return & "Die Aktion wirkt rekursiv auf Dateien und alle Unterordner. Die Dateien bleiben in Nextcloud erhalten und müssen vor der nächsten lokalen Nutzung erneut heruntergeladen werden." buttons {"Abbrechen", "Speicher freigeben"} default button "Abbrechen" cancel button "Abbrechen" with icon caution
+				return true
+			on error number -128
+				return false
+			end try
+		end if
+	end repeat
+	return true
+end confirmRecursiveRelease
 
 -- Dateien auf die App gezogen
 on open theItems
@@ -168,7 +185,7 @@ on pickFromFrontWindow()
 	set ncpin to my ncpinPath()
 	set rawList to ""
 	try
-		set rawList to do shell script "/usr/bin/python3 " & quoted form of ncpin & " list " & quoted form of folderPath
+		set rawList to do shell script "/usr/bin/python3 -B " & quoted form of ncpin & " list " & quoted form of folderPath
 	on error errMsg number errNum
 		-- errMsg enthaelt die Original-Fehlermeldung von ncpin (z.B. "Ordner nicht gefunden"
 		-- oder "nicht in einem Nextcloud-Ordner"), daher direkt anzeigen statt pauschale Meldung.

@@ -1319,27 +1319,73 @@ def canonical_path(path):
     return os.path.realpath(os.path.abspath(os.path.expanduser(path)))
 
 
+class RegisteredRoot(str):
+    """Unveränderlicher Wurzelpfad mit der bei Registrierung gelesenen Identität."""
+
+    def __new__(cls, path, identity):
+        root = str.__new__(cls, path)
+        root.identity = identity
+        return root
+
+
+def _snapshot_root(root):
+    dirfd = _open_canonical_dir(canonical_path(root))
+    try:
+        st = os.fstat(dirfd)
+        return RegisteredRoot(_fd_path(dirfd), (st.st_dev, st.st_ino))
+    finally:
+        os.close(dirfd)
+
+
 def canonical_roots(roots):
-    """Kanonisiert und dedupliziert die vom Client registrierten Wurzeln."""
+    """Fixiert Ort und Identität der vom Client registrierten Wurzeln."""
     result = []
     for root in roots:
-        canonical = canonical_path(root)
+        try:
+            canonical = _snapshot_root(root)
+        except OSError:
+            continue
         if canonical not in result:
             result.append(canonical)
     return result
 
 
 def in_any_folder(path, roots):
-    """True, wenn der reale Pfad in einer realen registrierten Wurzel liegt."""
+    """Prüft die feste Wurzelgrenze und berücksichtigt echte APFS-Pfadaliase.
+
+    Die Wurzel darf während einer Aktion weder ersetzt noch per Symlink nach
+    außen umgeleitet werden. Schreibungsvarianten werden über die Identität
+    des passenden Vorfahren erkannt, ohne verschiedene Verzeichnisse auf
+    case-sensitiven Volumes durch pauschales Casefolding gleichzusetzen.
+    """
     candidate = canonical_path(path)
     for root in roots:
-        canonical_root = canonical_path(root)
         try:
-            if os.path.commonpath([candidate, canonical_root]) == canonical_root:
+            trusted = root if isinstance(root, RegisteredRoot) else _snapshot_root(root)
+            dirfd = _open_canonical_dir(trusted)
+            try:
+                st = os.fstat(dirfd)
+                if ((st.st_dev, st.st_ino) != trusted.identity
+                        or _fd_path(dirfd) != trusted):
+                    continue
+            finally:
+                os.close(dirfd)
+            if os.path.commonpath([candidate, trusted]) == trusted:
                 return True
-        except ValueError:
-            # Unterschiedliche Laufwerke/Pfadformen koennen keine Zugehoerigkeit
-            # bilden. Auf macOS selten, aber kontrolliert ablehnen statt crashen.
+            parts = candidate.strip(os.sep).split(os.sep)
+            depth = len(trusted.strip(os.sep).split(os.sep))
+            if len(parts) < depth:
+                continue
+            ancestor = os.sep + os.sep.join(parts[:depth])
+            aliasfd = _open_canonical_dir(ancestor)
+            try:
+                st = os.fstat(aliasfd)
+                if ((st.st_dev, st.st_ino) == trusted.identity
+                        and _fd_path(aliasfd) == trusted):
+                    return True
+            finally:
+                os.close(aliasfd)
+        except (OSError, ValueError):
             continue
     return False
 
@@ -1365,18 +1411,19 @@ def list_entries(folder, roots):
       - alphabetisch sortiert + dedupliziert.
     Gibt eine Liste logischer Namen (ohne Pfad) zurueck.
     """
-    # Unmittelbar vor dem Dateisystemzugriff erneut kanonisieren. Dadurch kann
-    # ein Symlink unterhalb der Syncwurzel nicht in ein fremdes Verzeichnis
-    # zeigen und dessen Namen ueber den Toolbar-Picker preisgeben.
     folder = checked_path(folder, roots)
     names = []
     seen = set()
+    dirfd = _open_checked_dir(folder, roots)
     try:
-        entries = sorted(os.listdir(folder))
-    except OSError:
-        return names
+        _assert_dir_unmoved(dirfd, roots)
+        entries = sorted(os.listdir(dirfd))
+    finally:
+        os.close(dirfd)
     for nm in entries:
-        if nm.startswith("."):
+        # Der Picker benutzt eine Zeile pro Name; Umbrüche könnten sonst eine
+        # zweite, tatsächlich vorhandene Datei als Auswahl erscheinen lassen.
+        if nm.startswith(".") or "\n" in nm or "\r" in nm:
             continue
         logical = nm[:-len(SUFFIX)] if nm.endswith(SUFFIX) else nm
         if logical and logical not in seen:
@@ -1523,7 +1570,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.9")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.10")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)
@@ -1663,6 +1710,9 @@ def main(argv):
         except PathOutsideRoots:
             sys.stderr.write("Fehler: nicht in einem Nextcloud-Ordner.\n")
             return 3
+        except OSError as exc:
+            sys.stderr.write("Fehler: Ordner nicht lesbar: %s\n" % exc)
+            return 1
         if args.json:
             print(json.dumps({"folder": folder, "entries": names},
                              ensure_ascii=False, indent=2))
@@ -1729,6 +1779,9 @@ def main(argv):
                     continue
                 target = "online" if cur == "local" else "local"
 
+            if target == "online" and os.path.isdir(ondisk) and not args.json and not args.quiet:
+                sys.stderr.write("Hinweis: Speicherfreigabe wirkt rekursiv auf Dateien und Unterordner in %s.\n" % ondisk)
+                sys.stderr.flush()
             if transport == "socket":
                 do_action(sock, ondisk, target, roots)
             else:
