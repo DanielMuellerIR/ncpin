@@ -473,9 +473,21 @@ class InstallerTest(unittest.TestCase):
         self.install_ok()
         self.assertTrue(os.path.isdir(self.app()))
 
+    def test_stage_only_builds_artifacts_without_installing(self):
+        stage = os.path.join(self.root, "new-parent", "stage")
+        result = self.run_installer("--stage-only", stage)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("BUILD OK", result.stdout)
+        for name in ("Lokal halten.app", "Speicher freigeben.app",
+                     "Lokal halten (Nextcloud).workflow", "Speicher freigeben (Nextcloud).workflow"):
+            self.assertTrue(os.path.isdir(os.path.join(stage, name)))
+        self.assertEqual(os.listdir(self.apps), [])
+        self.assertEqual(os.listdir(self.services), [])
+        self.assertEqual(os.listdir(self.links), [])
+
     def test_stage_only_refuses_the_protected_target(self):
-        # --stage-only prueft weder Notary-Ticket noch Kollision und entfernt am
-        # Zielort gleichnamige Artefakte mit rm -rf. Ins geschuetzte Verzeichnis
+        # --stage-only prueft weder Notary-Ticket noch Kollision und ersetzt am
+        # Zielort gleichnamige Artefakte. Ins geschuetzte Verzeichnis
         # darf es deshalb gar nicht erst bauen — sonst waere es der Weg an
         # beiden Schranken vorbei. Der installierte Stand bleibt unberuehrt.
         self.install_ok()

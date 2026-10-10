@@ -290,7 +290,7 @@ reject_stage_install_overlap() {
 }
 
 # --stage-only baut nur heraus: Es prueft weder Ticket noch Kollision und
-# entfernt am Zielort gleichnamige Artefakte mit rm -rf. Genau deshalb darf es
+# ersetzt am Zielort gleichnamige Artefakte. Genau deshalb darf es
 # nie ins geschuetzte Verzeichnis schreiben — sonst waere "./build.sh
 # /Applications" ein Weg an beiden Schranken vorbei.
 if [ "$STAGE_ONLY" -eq 1 ]; then
@@ -539,11 +539,9 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
 "FEHLER: --stage-only darf nicht nach $STAGE_DIR bauen.
 Dort liegen ausschliesslich installierte, notarisierte Bundles."
 	reject_stage_install_overlap
-	mkdir -p -- "$STAGE_DIR"
-	for artefakt in "$BUILT_APP1" "$BUILT_APP2" "$BUILT_QA1" "$BUILT_QA2"; do
-		rm -rf -- "$STAGE_DIR/${artefakt:t}"
-		/usr/bin/ditto "$artefakt" "$STAGE_DIR/${artefakt:t}"
-	done
+	/usr/bin/python3 -B "$REPO/tools/atomic_replace.py" --stage "$STAGE_DIR" "$PROTECTED_APPS" \
+		"$APP1" "$APP2" "$QA1" "$QA2" "$LINK" -- \
+		"$BUILT_APP1" "$BUILT_APP2" "$BUILT_QA1" "$BUILT_QA2"
 	echo "BUILD OK: $STAGE_DIR (nicht installiert)"
 	exit 0
 fi

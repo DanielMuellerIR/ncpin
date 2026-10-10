@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.11 bindet Staging-Schreibzugriffe an das geöffnete Ausgabeverzeichnis und lehnt Verzeichnisänderungen während des Builds ab. Pin-Aktionen akzeptieren APFS-Schreibungsvarianten auch in der konfigurierten Syncwurzel. Unvollständige Socket-Flagfelder lösen kein `toggle` aus; Wartezeiten müssen positiv und endlich sein. Ordnernamen behalten im Picker ihren Suffix, damit die Rekursionsbestätigung greift. Der Releaseabschluss lehnt ein Verzeichnis am DMG-Pfad ab und erhält das geprüfte Image, falls der Austausch scheitert.
+
 Version 1.3.10 bindet jede registrierte Syncwurzel an ihren ursprünglichen Ort und ihre Dateisystemidentität, akzeptiert gültige APFS-Schreibungsvarianten und liest Ordnerlisten über einen geprüften Verzeichnisdeskriptor. Staging darf installierte Artefakte nicht überlappen; Uninstall prüft den Besitz nach dem Isolieren eines Ziels erneut. Quick Actions erhalten den CLI-Exitcode; ein fehlgeschlagener Release-Build erhält das vorherige DMG.
 
 Version 1.3.9 verarbeitet auch Unicode-Schreibungsvarianten, die nach dem Groß-/Kleinschreibungsabgleich erneut normalisiert werden müssen. Wird eine Installation nach einem atomaren Austausch unterbrochen, erkennt der Installer den erfolgten Austausch auch bei beendetem Helfer und stellt den Altstand wieder her, einschließlich mit `--force` ersetzter fremder Ziele.

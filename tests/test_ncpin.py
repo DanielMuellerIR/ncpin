@@ -296,6 +296,15 @@ class CliParserTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_invalid_timeout_is_rejected_before_any_transport_access(self):
+        for value in ("nan", "inf", "-inf", "0", "-1", "nonsense"):
+            for command in ("local", "online", "toggle"):
+                with self.subTest(value=value, command=command):
+                    self.assert_usage_error_before_socket(
+                        [command, self.first, "--wait", "--timeout=" + value, "--json"])
+                    self.assertTrue(os.path.isfile(self.first))
+                    self.assertFalse(os.path.exists(self.first + self.ncpin.SUFFIX))
+
     def assert_usage_error_before_socket(self, arguments):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -423,6 +432,15 @@ class PathBoundaryTests(unittest.TestCase):
     def test_unknown_toggle_sends_no_make_command(self):
         path = self.protocol_fixture()
         self.server.menu_chunks = [b"MENU_ITEM:OTHER::Other\nGET_MENU_ITEMS:END\n"]
+        rc, out, _err = self.run_cli("toggle", "--json", path)
+        self.assertEqual(rc, 1)
+        self.assertIn("toggle abgebrochen", json.loads(out)[0]["error"])
+        self.assertFalse(any(cmd.startswith("MAKE_") for cmd in self.server.commands))
+
+    def test_truncated_disabled_field_at_idle_timeout_sends_no_make(self):
+        path = self.protocol_fixture()
+        self.server.menu_chunks = [
+            b"MENU_ITEM:MAKE_AVAILABLE_LOCALLY:d:Lokal\nMENU_ITEM:MAKE_ONLINE_ONLY:"]
         rc, out, _err = self.run_cli("toggle", "--json", path)
         self.assertEqual(rc, 1)
         self.assertIn("toggle abgebrochen", json.loads(out)[0]["error"])
@@ -1089,6 +1107,40 @@ class RenameTransportTests(unittest.TestCase):
         rc, out, err = self.run_cli("local", "--json", alias)
         self.assertEqual(rc, 0, err + out)
         self.assertTrue(os.path.exists(os.path.join(self.root, "datei.txt")))
+
+    def test_case_variant_config_root_accepts_both_pin_actions(self):
+        self._skip_unless_case_insensitive()
+        with open(self.cfg, encoding="utf-8") as handle:
+            config = handle.read()
+        with open(self.cfg, "w", encoding="utf-8") as handle:
+            handle.write(config.replace(self.root, os.path.join(self.tmp.name, "NEXTCLOUD")))
+        local = self.make_file("local.txt")
+        placeholder = self.make_placeholder("online.txt")
+        rc, out, err = self.run_cli("status", "--json", local, placeholder)
+        self.assertEqual(rc, 0, err + out)
+        for command, path in (("online", local), ("local", placeholder)):
+            rc, out, err = self.run_cli(command, "--json", path)
+            self.assertEqual(rc, 0, err + out)
+        self.assertTrue(os.path.isfile(local + self.ncpin.SUFFIX))
+        self.assertTrue(os.path.isfile(placeholder[:-len(self.ncpin.SUFFIX)]))
+
+    def test_picker_preserves_suffixed_directory_for_recursive_confirmation(self):
+        folder = os.path.join(self.root, "Folder" + self.ncpin.SUFFIX)
+        local = self.make_file("Folder" + self.ncpin.SUFFIX + "/file.txt")
+        self.make_placeholder("online.txt")
+        rc, out, err = self.run_cli("list", "--json", self.root)
+        self.assertEqual(rc, 0, err + out)
+        names = json.loads(out)["entries"]
+        self.assertIn(os.path.basename(folder), names)
+        self.assertIn("online.txt", names)
+        picked = os.path.join(self.root, names[0])
+        self.assertEqual(picked, folder)
+        # Dieselbe Bedingung verwendet der unveränderte AppleScript-Dialog.
+        import subprocess
+        self.assertEqual(subprocess.run(["/bin/test", "-d", picked]).returncode, 0)
+        rc, out, err = self.run_cli("online", "--json", picked)
+        self.assertEqual(rc, 0, err + out)
+        self.assertTrue(os.path.isfile(local + self.ncpin.SUFFIX))
 
     def test_syncroot_symlink_replacement_during_journal_load_is_rejected(self):
         self.make_placeholder("ordner/datei.txt")

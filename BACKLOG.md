@@ -18,6 +18,29 @@
 Die vorhandenen flachen Icons bleiben bestehen. Das optionale Foto-Pin-Experiment
 ist derzeit nicht geplant.
 
+Erledigt mit ncpin 1.3.11:
+
+- Staging arbeitet relativ zum geöffneten Ausgabeverzeichnis und prüft dessen
+  ursprünglichen Ort, Identität und Installationsgrenzen vor jedem Kopieren,
+  Austausch und Entfernen. Ein Pfadaustausch leitet keine Ausgabe in eine
+  bestehende Installation um.
+- Rename-Kontext und Journalpfade verwenden den registrierten Kernelpfad;
+  APFS-Schreibungsvarianten in der Client-Konfiguration funktionieren für beide
+  Pin-Aktionen. Abgeschnittene Socket-Flagfelder ergeben `unknown`.
+- Ungültige Wartezeiten werden vor jedem Transportzugriff mit Exit 2 abgelehnt.
+  Verzeichnisse behalten ihren Suffix in `list`, damit der Picker sie vor der
+  rekursiven Speicherfreigabe als Ordner erkennt.
+- Der Releaseabschluss ersetzt den exakten DMG-Pfad und erhält das geprüfte
+  Zwischenimage bei einer Verzeichniskollision. Redundante lokale Imports und
+  der unzutreffende Lazy-Loading-Kommentar sind bereinigt.
+- 159 automatisierte Tests bestanden: vollständige Suite mit 158 Tests plus
+  zusätzlicher Installer-Staging-Integrationstest, jeweils mit minimaler
+  Umgebung und macOS-System-Python. Python-/Shell-Syntax, CLI-Hilfe, Doctor und
+  reales nicht mutierendes Latenzgate mit drei Durchläufen bestanden.
+- Der Picker-Datenfluss ist bis zur echten `test -d`-Bestätigungsbedingung
+  geprüft. Der unveränderte Dialog wurde nicht erneut in Finder ausgeführt;
+  installierte Apps und öffentliche Releaseartefakte wurden nicht aktualisiert.
+
 Erledigt mit ncpin 1.3.10:
 
 - Syncwurzeln bleiben während einer Operation an ursprünglichen Kernelpfad und

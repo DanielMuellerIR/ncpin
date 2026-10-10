@@ -82,6 +82,10 @@ RW_DMG="$DIST/ncpin-rw.dmg"
 # nachgelagerte Automatisierung hielte es fuer ein fertiges Release.
 PARTIAL_DMG="$DIST/ncpin-unfertig.dmg"
 mkdir -p -- "$DIST"
+if [ -d "$DMG" ]; then
+	print -u2 -- "FEHLER: Releaseziel ist ein Verzeichnis: $DMG"
+	exit 2
+fi
 # Das letzte geprüfte Image bleibt erhalten, bis der neue Lauf vollständig
 # erfolgreich ist und es am Ende atomar ersetzt.
 rm -f -- "$RW_DMG" "$PARTIAL_DMG"
@@ -235,7 +239,15 @@ spctl --assess --type open --context context:primary-signature -v "$PARTIAL_DMG"
 # notarisiert, gestapelt und von Gatekeeper akzeptiert.
 FINAL_SRC="$PARTIAL_DMG"
 PARTIAL_DMG=""
-if ! mv -f -- "$FINAL_SRC" "$DMG"; then
+if ! /usr/bin/python3 -B - "$FINAL_SRC" "$DMG" <<'PY'
+import os
+import sys
+
+os.replace(sys.argv[1], sys.argv[2])
+if not os.path.isfile(sys.argv[2]) or os.path.islink(sys.argv[2]):
+    raise RuntimeError("Releaseziel ist keine reguläre DMG-Datei")
+PY
+then
 	print -u2 -- "FEHLER: Verschieben nach $DMG fehlgeschlagen. Fertiges Releaseartefakt liegt unter: $FINAL_SRC"
 	exit 1
 fi
