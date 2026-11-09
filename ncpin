@@ -252,7 +252,10 @@ def read_registered_paths(sock_path):
         # nicht. _recv_burst erkennt das Ende an der Idle-Luecke nach dem Burst
         # (frueher blockierte hier ein zweites recv bis zum 3s-Socket-Timeout).
         text = _recv_burst(s, HANDSHAKE_WAIT)
-        for line in text.splitlines():
+        # Nur mit LF abgeschlossene Protokollzeilen registrieren: Ein am
+        # Elternpfad abgeschnittener Root darf die Sicherheitsgrenze nie erweitern.
+        for line in text.split("\n")[:-1]:
+            line = line.rstrip("\r")
             if line.startswith("REGISTER_PATH:"):
                 registered = line[len("REGISTER_PATH:"):]
                 if registered:
@@ -1592,7 +1595,7 @@ def build_parser():
                "  ncpin doctor                             # Client/Socket prüfen",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--version", action="version", version="ncpin 1.3.11")
+    ap.add_argument("--version", action="version", version="ncpin 1.3.12")
     ap.set_defaults(paths=[], json=False, quiet=False, socket=None,
                     wait=False, timeout=30.0)
     subparsers = ap.add_subparsers(dest="command", required=True)

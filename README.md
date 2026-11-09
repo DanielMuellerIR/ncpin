@@ -67,6 +67,8 @@ backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
+Version 1.3.12 (2026-11-09) accepts socket sync roots only from newline-terminated `REGISTER_PATH` records. A truncated handshake cannot authorize a parent directory outside the actual sync root.
+
 Version 1.3.11 binds staging writes to the opened output directory and rejects directory changes during a build. Pin actions also accept APFS spelling variants in the configured sync root. Incomplete socket flag fields cannot trigger `toggle`; timeouts must be positive and finite. Folder names retain their suffix in the picker so recursive confirmation applies. Release finalization rejects a directory at the DMG path and preserves the verified image if replacement fails.
 
 Version 1.3.10 keeps each registered sync root tied to its original location and filesystem identity, accepts valid APFS spelling variants, and reads folder lists through a verified directory descriptor. Staging cannot overlap installed artifacts; uninstall rechecks ownership after isolating a target. Quick Actions preserve CLI exit codes, and a failed release build retains the previous DMG.
