@@ -146,28 +146,61 @@ def stage_artifacts(destination, protected, installed, sources):
             os.close(probe)
         check_boundaries(original)
 
+    def remove_checked(path, expected):
+        validate()
+        if not os.path.lexists(path):
+            return
+        if expected is None or not os.path.samestat(expected, os.lstat(path)):
+            raise RuntimeError("Zwischenstand wurde ersetzt; erhalten unter %s" %
+                               os.path.join(_directory_path(fd), path))
+        if os.path.islink(path) or not os.path.isdir(path):
+            os.unlink(path)
+        else:
+            shutil.rmtree(path)
+
     try:
         os.fchdir(fd)
         for source, name in zip(sources, names):
             validate()
             holding = tempfile.mkdtemp(prefix=".ncpin-build-", dir=".")
+            holding_identity = os.lstat(holding)
             artifact = os.path.join(holding, "artifact")
-            # ditto schreibt nur in einen neuen privaten Baum, niemals in ein
-            # vorhandenes Bundle oder einen nachträglich eingesetzten Symlink.
-            validate()
-            subprocess.run(["/usr/bin/ditto", source, artifact], check=True)
-            validate()
             pending = holding + "-artifact"
-            _renamex(artifact, pending, RENAME_EXCL)
-            validate()
-            os.rmdir(holding)
-            validate()
-            atomic_replace(pending, os.path.join(".", name))
-            validate()
-            if os.path.islink(pending) or os.path.isfile(pending):
-                os.unlink(pending)
-            elif os.path.isdir(pending):
-                shutil.rmtree(pending)
+            new_identity = None
+            try:
+                # ditto schreibt nur in einen neuen privaten Baum, niemals in ein
+                # vorhandenes Bundle oder einen nachträglich eingesetzten Symlink.
+                validate()
+                subprocess.run(["/usr/bin/ditto", source, artifact], check=True)
+                validate()
+                new_identity = os.lstat(artifact)
+                _renamex(artifact, pending, RENAME_EXCL)
+                remove_checked(holding, holding_identity)
+                validate()
+                target = os.path.join(".", name)
+                old_identity = os.lstat(target) if os.path.lexists(target) else None
+                atomic_replace(pending, target)
+                remove_checked(pending, old_identity)
+            except BaseException as exc:
+                problems = []
+                for path, expected in ((holding, holding_identity), (pending, new_identity)):
+                    try:
+                        if not os.path.lexists(path):
+                            continue
+                        # Nach dem Swap gehört der Zwischenstand nicht mehr zum
+                        # Neubau. Bei Fehlern bleibt er für die Wiederherstellung.
+                        if path == pending and (expected is None or not os.path.samestat(
+                                expected, os.lstat(path))):
+                            raise RuntimeError("Altstand erhalten unter %s" %
+                                               os.path.join(_directory_path(fd), path))
+                        remove_checked(path, expected)
+                    except BaseException as cleanup_error:
+                        problems.append("%s (Pfad: %s)" %
+                                        (cleanup_error, os.path.join(_directory_path(fd), path)))
+                if problems:
+                    raise RuntimeError("%s; %s" % (exc, "; ".join(problems))) from exc
+                raise
+
         validate()
     finally:
         os.fchdir(previous)

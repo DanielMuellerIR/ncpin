@@ -18,6 +18,18 @@
 Die vorhandenen flachen Icons bleiben bestehen. Das optionale Foto-Pin-Experiment
 ist derzeit nicht geplant.
 
+Erledigt mit ncpin 1.3.13:
+
+- Fehler und abfangbare Unterbrechungen beim Stage-Build entfernen eigene
+  unveröffentlichte Teilkopien nach erneuter Grenz- und Identitätsprüfung.
+  Nach einem bereits erfolgten Austausch bleibt bei Fehlern der Altstand
+  erhalten; die Fehlermeldung nennt seinen Wiederherstellungspfad.
+- Regressionen decken Kopierfehler mit anschließendem Wiederholungslauf,
+  fehlgeschlagene Veröffentlichung, Fehler nach dem Swap, Unterbrechungen
+  und eine fremde Ersetzung des Zwischenstands ab.
+- Alle 167 automatisierten Tests mit minimaler Umgebung und macOS-System-
+  Python bestanden. Das reale nicht mutierende Latenzgate ist grün.
+
 Erledigt mit ncpin 1.3.11:
 
 - Staging arbeitet relativ zum geöffneten Ausgabeverzeichnis und prüft dessen
