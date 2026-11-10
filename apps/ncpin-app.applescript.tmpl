@@ -44,12 +44,10 @@ on runNcpin(posixPaths)
 	repeat with p in posixPaths
 		set argline to argline & " " & quoted form of (p as text)
 	end repeat
-	-- ncpin normalisiert Optionen fuer Apples System-Python 3.9 und akzeptiert
-	-- --wait vor, zwischen oder nach den Pfaden. Die Position am Ende bleibt fuer
-	-- alte lokale Installationen kompatibel.
-	-- Ausdruecklich mit dem System-Python starten: Die CLI im Bundle muss dafuer
-	-- weder ein Ausfuehrbit noch ein passendes "python3" im PATH haben.
-	set cmd to "/usr/bin/python3 -B " & quoted form of ncpin & " " & ncAction & argline & " --wait"
+	-- Die App bestätigt den Auftrag, nicht den fertigen Download. --wait würde
+	-- große Downloads blockierend abwarten und trotz laufendem Sync Fehler melden.
+	-- System-Python und -B erhalten die versiegelte, portable Bundle-Kopie.
+	set cmd to "/usr/bin/python3 -B " & quoted form of ncpin & " " & ncAction & argline
 	try
 		set out to do shell script cmd
 		set objectCount to count of posixPaths
@@ -58,7 +56,7 @@ on runNcpin(posixPaths)
 		else
 			set objectLabel to "Objekte"
 		end if
-		display notification (ncLabel & ": " & objectCount & " " & objectLabel & " verarbeitet.") with title "Nextcloud"
+		display notification (ncLabel & ": " & objectCount & " " & objectLabel & " beauftragt. Nextcloud arbeitet im Hintergrund weiter.") with title "Nextcloud"
 	on error errMsg number errNum
 		display dialog "ncpin-Fehler (" & errNum & "):" & return & errMsg buttons {"OK"} default button "OK" with icon stop
 	end try

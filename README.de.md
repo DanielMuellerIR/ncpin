@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.14 (2026-11-10) lässt die beiden Apps die Übergabe des Pin-Auftrags bestätigen; Nextcloud arbeitet anschließend im Hintergrund weiter. Die Apps warten nicht mehr auf fertige Downloads und melden keinen Wartezeitfehler bei weiterlaufender Synchronisation. Prüf- und Übergabefehler werden weiterhin angezeigt; die CLI behält `--wait`.
+
 Version 1.3.13 (2026-11-10) räumt unveröffentlichte Stage-Kopien nach Buildfehlern oder Unterbrechungen auf und prüft vor dem Entfernen erneut Verzeichnisgrenzen und Artefaktidentität. Hat der Austausch bereits stattgefunden, erhält ein fehlgeschlagener Build den Altstand und meldet dessen Wiederherstellungspfad.
 
 Version 1.3.12 (2026-11-09) akzeptiert Socket-Syncwurzeln nur aus mit Zeilenumbruch abgeschlossenen `REGISTER_PATH`-Datensätzen. Ein abgeschnittener Handshake kann kein Elternverzeichnis außerhalb der eigentlichen Syncwurzel freigeben.
@@ -117,6 +119,8 @@ Jede App trägt eine eigene Kopie der CLI `ncpin` im Bundle
 damit kein absoluter Pfad des Build-Macs; die Apps funktionieren auch, wenn man sie aus dem DMG auf
 einen anderen Mac zieht oder später verschiebt. Eine neu gebaute CLI erreicht eine installierte App
 nur über einen erneuten `./install.sh`-Lauf.
+
+Die Apps prüfen und übergeben den Auftrag und bestätigen anschließend die Übergabe. Nextcloud führt Downloads oder Speicherfreigaben im Hintergrund zu Ende. Wer ausdrücklich auf den Zielzustand warten möchte, nutzt die CLI mit `--wait`.
 
 - Auto-erkannt; per Env steuerbar: `NCPIN_SIGN_ID`, `NOTARY_PROFILE` bzw. das ältere `NCPIN_NOTARY_PROFILE` (ein
   `xcrun notarytool store-credentials`-Profil), `NCPIN_NOTARIZE=0` (bewusst nur signieren, z.B.

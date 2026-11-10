@@ -18,6 +18,18 @@
 Die vorhandenen flachen Icons bleiben bestehen. Das optionale Foto-Pin-Experiment
 ist derzeit nicht geplant.
 
+Erledigt mit ncpin 1.3.14:
+
+- Beide Apps übergeben Pin-Aufträge ohne blockierendes Warten auf fertige
+  Downloads. Die Rückmeldung bestätigt den Auftrag und nennt die weitere
+  Hintergrundarbeit von Nextcloud. Prüf- und Übergabefehler bleiben sichtbar;
+  die CLI behält `--wait`.
+- Kompilierte AppleScript-Handler beider Aktionen mit Pfaden mit Leerzeichen
+  und Apostroph geprüft. Die Gegenprobe scheitert am alten `--wait`-Aufruf.
+- Alle 168 Tests mit macOS-System-Python in minimaler Umgebung bestanden.
+  Beide Apps signiert, notarisiert, gestapelt und installiert; Version,
+  Signatur, Ticket, Gatekeeper und Aufruf am installierten Bundle geprüft.
+
 Erledigt mit ncpin 1.3.13:
 
 - Fehler und abfangbare Unterbrechungen beim Stage-Build entfernen eigene
