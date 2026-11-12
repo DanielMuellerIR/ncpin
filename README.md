@@ -67,6 +67,8 @@ backup and reports its path instead of overwriting the changed target.
 `./install.sh --uninstall` removes only artifacts with the matching ncpin ownership marker or the
 exact ncpin symlink.
 
+Version 1.3.15 (2026-11-12) preserves replaced staging artifacts during cleanup and supports staging with modern Python versions.
+
 Version 1.3.14 (2026-11-10) makes the two apps confirm that the pin request was submitted, then lets Nextcloud continue in the background. The apps no longer wait for downloads to finish or report a wait timeout while synchronization continues. Validation and submission errors are still shown; the CLI retains `--wait`.
 
 Version 1.3.13 (2026-11-10) cleans up unpublished staging copies after build failures or interruptions, checking directory boundaries and artifact identity again before removal. If a swap has already occurred, a failed build preserves the previous artifact and reports its recovery path.

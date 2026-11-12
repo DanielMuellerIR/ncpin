@@ -69,6 +69,8 @@ statt das veränderte Ziel zu überschreiben.
 Der Aufruf `./install.sh --uninstall` entfernt ausschließlich Artefakte mit passendem ncpin-Besitzmarker
 beziehungsweise den exakten ncpin-Symlink.
 
+Version 1.3.15 (2026-11-12) erhält ausgetauschte Zwischenstände bei der Bereinigung und unterstützt den Stage-Bau mit modernen Python-Versionen.
+
 Version 1.3.14 (2026-11-10) lässt die beiden Apps die Übergabe des Pin-Auftrags bestätigen; Nextcloud arbeitet anschließend im Hintergrund weiter. Die Apps warten nicht mehr auf fertige Downloads und melden keinen Wartezeitfehler bei weiterlaufender Synchronisation. Prüf- und Übergabefehler werden weiterhin angezeigt; die CLI behält `--wait`.
 
 Version 1.3.13 (2026-11-10) räumt unveröffentlichte Stage-Kopien nach Buildfehlern oder Unterbrechungen auf und prüft vor dem Entfernen erneut Verzeichnisgrenzen und Artefaktidentität. Hat der Austausch bereits stattgefunden, erhält ein fehlgeschlagener Build den Altstand und meldet dessen Wiederherstellungspfad.

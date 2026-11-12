@@ -153,16 +153,29 @@ def stage_artifacts(destination, protected, installed, sources):
         if expected is None or not os.path.samestat(expected, os.lstat(path)):
             raise RuntimeError("Zwischenstand wurde ersetzt; erhalten unter %s" %
                                os.path.join(_directory_path(fd), path))
-        if os.path.islink(path) or not os.path.isdir(path):
-            os.unlink(path)
+        # Der öffentliche Stage-Name kann nach der Prüfung ausgetauscht werden.
+        # Erst exklusiv in einen privaten Baum übernehmen und dort erneut prüfen.
+        cleanup = tempfile.mkdtemp(prefix=".ncpin-cleanup-", dir=".")
+        claimed = os.path.join(cleanup, "artifact")
+        try:
+            _renamex(path, claimed, RENAME_EXCL)
+        except BaseException:
+            os.rmdir(cleanup)
+            raise
+        if not os.path.samestat(expected, os.lstat(claimed)):
+            raise RuntimeError("Zwischenstand wurde ersetzt; erhalten unter %s" %
+                               os.path.join(_directory_path(fd), claimed))
+        if os.path.islink(claimed) or not os.path.isdir(claimed):
+            os.unlink(claimed)
         else:
-            shutil.rmtree(path)
+            shutil.rmtree(claimed)
+        os.rmdir(cleanup)
 
     try:
         os.fchdir(fd)
         for source, name in zip(sources, names):
             validate()
-            holding = tempfile.mkdtemp(prefix=".ncpin-build-", dir=".")
+            holding = os.path.join(".", os.path.basename(tempfile.mkdtemp(prefix=".ncpin-build-", dir=".")))
             holding_identity = os.lstat(holding)
             artifact = os.path.join(holding, "artifact")
             pending = holding + "-artifact"

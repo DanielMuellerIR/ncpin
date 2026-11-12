@@ -122,6 +122,31 @@ class StagingTests(unittest.TestCase):
         self.assertEqual((preserved[0] / "data").read_text(), "foreign")
         self.assert_installation_unchanged()
 
+    def test_swap_after_identity_check_preserves_foreign_tree(self):
+        self.run_stage()
+        rename = self.helper._renamex
+        replaced = False
+
+        def replace_before_claim(source, destination, flags):
+            nonlocal replaced
+            if (not replaced and str(source).endswith("-artifact")
+                    and Path(destination).parent.name.startswith(".ncpin-cleanup-")):
+                replaced = True
+                Path(source).rename(self.root / "saved-original")
+                Path(source).mkdir()
+                (Path(source) / "foreign").write_text("preserve")
+            return rename(source, destination, flags)
+
+        with mock.patch.object(self.helper, "_renamex", side_effect=replace_before_claim):
+            with self.assertRaisesRegex(RuntimeError, "ersetzt; erhalten unter"):
+                self.run_stage()
+        self.assertTrue(replaced)
+        foreign = list(self.stage.glob(".ncpin-cleanup-*/artifact/foreign"))
+        self.assertEqual(len(foreign), 1)
+        self.assertEqual(foreign[0].read_text(), "preserve")
+        self.assertTrue((self.root / "saved-original" / "data").is_file())
+        self.assert_installation_unchanged()
+
     def test_stage_swap_after_first_copy_cannot_overwrite_installation(self):
         original = self.helper.subprocess.run
 
